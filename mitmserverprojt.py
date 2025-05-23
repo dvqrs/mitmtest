@@ -4,11 +4,9 @@ import signal
 import base64
 import logging
 import asyncio
-from urllib.parse import urlparse
 
 import requests
 from mitmproxy import http
-from mitmproxy import ctx
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
@@ -77,24 +75,23 @@ class AllInOne:
         pass
 
 async def run_proxy():
-    # 1) grab the running loop
+    # 1) We're already inside an async context, so get_running_loop() works
     loop = asyncio.get_running_loop()
 
-    # 2) configure mitmproxy options
+    # 2) Configure your mitmproxy options
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
 
-    # 3) instantiate DumpMaster *with* the loop
-    m = DumpMaster(opts, event_loop=loop)
+    # 3) Instantiate DumpMaster *without* event_loop kwarg
+    m = DumpMaster(opts)
     m.addons.add(AllInOne())
 
-    # 4) graceful shutdown on SIGINT/SIGTERM
+    # 4) Graceful shutdown on SIGINT/SIGTERM
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
 
     logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
-    # 5) this will run until shutdown is called
+    # 5) Run until shutdown is called
     await m.run()
 
 if __name__ == "__main__":
-    # Drive the async function with asyncio.run()
     asyncio.run(run_proxy())
