@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 import os
 import base64
 import requests
-import threading
 import signal
 import sys
+import asyncio
 
 from mitmproxy import http, ctx
 from mitmproxy.tools.dump import DumpMaster
@@ -21,7 +20,6 @@ BLOCK_MALICIOUS = True
 # Helpers
 # ────────────────────────────────────────────────────
 def ca_cert_path() -> str:
-    # mitmproxy writes its CA here by default
     return os.path.join(ctx.options.confdir, "mitmproxy-ca-cert.pem")
 
 def load_ca_bytes() -> bytes:
@@ -55,7 +53,6 @@ def is_malicious(url: str) -> bool:
 # ────────────────────────────────────────────────────
 class AllInOne:
     def request(self, flow: http.HTTPFlow) -> None:
-        # CA download request?
         if flow.request.method.upper() == "GET" and flow.request.path == "/mitmproxy-ca-cert.pem" and flow.request.scheme == "http":
             ca_bytes = load_ca_bytes()
             if not ca_bytes:
@@ -74,7 +71,6 @@ class AllInOne:
                 ctx.log.info("[CA] Served mitmproxy root certificate")
             return
 
-        # Otherwise proxy traffic
         url = flow.request.pretty_url
         ctx.log.info(f"[REQUEST] {url}")
         if BLOCK_MALICIOUS and is_malicious(url):
@@ -89,26 +85,23 @@ class AllInOne:
         pass
 
 # ────────────────────────────────────────────────────
-# AUTO-START mitmproxy
+# AUTO-START mitmproxy with asyncio
 # ────────────────────────────────────────────────────
-if __name__ == "__main__":
-    # Prepare mitmproxy options
+async def run_proxy():
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
     m = DumpMaster(opts)
-    # Register our addon
     m.addons.add(AllInOne())
 
-    # Graceful shutdown on signals
-    def shutdown(sig, frame):
+    def shutdown():
         ctx.log.info("Shutting down mitmproxy…")
-        m.shutdown()
-        sys.exit(0)
+        asyncio.create_task(m.shutdown())
 
-    signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, shutdown)
 
-    ctx.log.info(f"Starting mitmproxy all-in-one on port {MITM_PORT}...")
-    try:
-        m.run()
-    except KeyboardInterrupt:
-        shutdown(None, None)
+    ctx.log.info(f"[*] mitmproxy all-in-one running on port {MITM_PORT}…")
+    await m.run()
+
+if __name__ == "__main__":
+    asyncio.run(run_proxy())
