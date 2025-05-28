@@ -13,7 +13,7 @@ import requests
 # Config
 # ─────────────────────────────────────────────────────────
 MITM_PORT = int(os.getenv("MITM_PORT", 8443))
-VT_API_KEY = os.getenv("VT_API_KEY", "<your-virustotal-api-key>")
+VT_API_KEY = os.getenv("0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416", "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416")
 BLOCK_MALICIOUS = True
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
