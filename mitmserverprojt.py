@@ -4,17 +4,16 @@ import signal
 import base64
 import logging
 import asyncio
-
-import requests
 from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
+import requests
 
 # ─────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────
 MITM_PORT = 8443
-VT_API_KEY = os.getenv("0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416", "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416")
+VT_API_KEY = os.getenv("VT_API_KEY", "<your-virustotal-api-key>")
 BLOCK_MALICIOUS = True
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
@@ -22,6 +21,8 @@ CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
+# ─────────────────────────────────────────────────────────
+# VirusTotal check
 def is_malicious(url: str) -> bool:
     try:
         url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
@@ -31,38 +32,40 @@ def is_malicious(url: str) -> bool:
             timeout=10
         )
         if resp.status_code == 200:
-            stats = resp.json().get("data", {}) \
-                               .get("attributes", {}) \
-                               .get("last_analysis_stats", {})
+            stats = resp.json().get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
             return stats.get("malicious", 0) > 0
     except Exception as e:
         logger.warning(f"[!] VT check error: {e}")
     return False
 
+# ─────────────────────────────────────────────────────────
+# Addon with VT firewall + CA serving
 class AllInOne:
     def request(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # Serve CA cert
+        # Serve CA cert at /mitmproxy-ca-cert.pem
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
+                logger.warning(f"CA not found at {CA_PATH} (visit any HTTPS site to generate it)")
                 flow.response = http.Response.make(
                     404, b"CA not found", {"Content-Type": "text/plain"}
                 )
                 return
             with open(CA_PATH, "rb") as f:
-                cert = f.read()
+                body = f.read()
             flow.response = http.Response.make(
-                200, cert,
+                200, body,
                 {
                     "Content-Type": "application/x-pem-file",
+                    "Content-Length": str(len(body)),
                     "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem"
                 }
             )
             return
 
-        # Block malicious URLs
+        # Block malicious URLs in normal HTTP traffic
         if BLOCK_MALICIOUS and is_malicious(url):
             logger.warning(f"[BLOCKED] {url}")
             flow.response = http.Response.make(
@@ -71,27 +74,41 @@ class AllInOne:
                 {"Content-Type": "text/html"}
             )
 
+    def http_connect(self, flow: http.HTTPFlow):
+        """
+        Intercept HTTPS CONNECT requests and block based on host.
+        """
+        host = flow.request.host
+        # Use host to query VT
+        url = f"https://{host}/"
+        if BLOCK_MALICIOUS and is_malicious(url):
+            logger.warning(f"[BLOCKED CONNECT] {host}")
+            # Abort the tunnel
+            flow.kill()
+
     def response(self, flow: http.HTTPFlow):
+        # no custom response logic; default logging still applies
         pass
 
-async def run_proxy():
-    # 1) We're already inside an async context, so get_running_loop() works
-    loop = asyncio.get_running_loop()
-
-    # 2) Configure your mitmproxy options
+# ─────────────────────────────────────────────────────────
+# Async runner
+enasync def run_proxy():
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
-
-    # 3) Instantiate DumpMaster *without* event_loop kwarg
     m = DumpMaster(opts)
     m.addons.add(AllInOne())
+    loop = asyncio.get_running_loop()
 
-    # 4) Graceful shutdown on SIGINT/SIGTERM
+    def shutdown():
+        logger.info("[*] Shutting down mitmproxy…")
+        asyncio.create_task(m.shutdown())
+
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
+        loop.add_signal_handler(sig, shutdown)
 
     logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
-    # 5) Run until shutdown is called
     await m.run()
 
+# ─────────────────────────────────────────────────────────
+# Entrypoint
 if __name__ == "__main__":
     asyncio.run(run_proxy())
