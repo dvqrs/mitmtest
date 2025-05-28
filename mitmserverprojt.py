@@ -22,7 +22,9 @@ CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
+@lru_cache(maxsize=512)
 def is_malicious(url: str) -> bool:
+    domain = urlparse(url).netloc
     try:
         url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
         resp = requests.get(
@@ -31,14 +33,18 @@ def is_malicious(url: str) -> bool:
             timeout=10
         )
         if resp.status_code == 200:
-            stats = resp.json().get("data", {}) \
-                               .get("attributes", {}) \
-                               .get("last_analysis_stats", {})
+            stats = resp.json()["data"]["attributes"]["last_analysis_stats"]
             return stats.get("malicious", 0) > 0
+        elif resp.status_code == 429:
+            logger.warning(f"[!] VT rate-limit for {domain}, using previous cache or default block")
+            # If we’ve never seen this domain before, default to block:
+            return False if domain in is_malicious.cache_info().hits else True
+        else:
+            logger.warning(f"[!] VT API {resp.status_code} for {domain}")
     except Exception as e:
-        logger.warning(f"[!] VT check error: {e}")
+        logger.warning(f"[!] VT check error for {domain}: {e}")
+    # default to not malicious if everything else fails
     return False
-
 class AllInOne:
     def request(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
