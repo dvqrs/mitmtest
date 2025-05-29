@@ -5,7 +5,7 @@ import base64
 import logging
 import asyncio
 import itertools
-
+import time
 import requests
 from mitmproxy import http
 from mitmproxy.options import Options
@@ -24,59 +24,62 @@ VT_API_KEYS = [
     "16539b7c5e8140decd35a6110b00c5a794ee21f2bddb605e55e6c8c3e3ad6898",
     "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319",
 ]
-
-# Create a cycling iterator to rotate keys on each use
 _key_cycle = itertools.cycle(VT_API_KEYS)
-
-# Should we block malicious URLs?
 BLOCK_MALICIOUS = True
-
-# Path to mitmproxy CA cert
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
-# Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
 
 def get_vt_api_key() -> str:
-    """Return the next API key from the cycle."""
     return next(_key_cycle)
 
 
 def is_malicious(url: str) -> bool:
-    """Query VirusTotal for the URL; return True if flagged malicious."""
-    try:
-        api_key = get_vt_api_key()
-        # Log which key and URL we're checking
-        logger.info(f"[VT] using key ending with ...{api_key[-6:]} to check {url}")
+    """Submit URL for analysis and poll until complete, return True if malicious."""
+    api_key = get_vt_api_key()
+    headers = {"x-apikey": api_key}
+    logger.info(f"[VT] submitting {url} with key ending ...{api_key[-6:]}")
 
-        # VT expects a URL ID encoded in base64 without padding
-        url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
-        headers = {"x-apikey": api_key}
+    # 1) Submit URL for analysis
+    sub = requests.post(
+        "https://www.virustotal.com/api/v3/urls",
+        headers=headers,
+        data={"url": url},
+        timeout=10
+    )
+    if sub.status_code != 200:
+        logger.warning(f"[!] VT submission failed ({sub.status_code}) for {url}")
+        return False
+    analysis_id = sub.json().get("data", {}).get("id")
+    if not analysis_id:
+        logger.warning(f"[!] VT returned no analysis ID for {url}")
+        return False
+
+    # 2) Poll analysis until complete
+    for attempt in range(12):  # ~1 minute max, 5s interval
         resp = requests.get(
-            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
             headers=headers,
             timeout=10
         )
-
         if resp.status_code == 200:
-            stats = resp.json().get("data", {}) \
-                               .get("attributes", {}) \
-                               .get("last_analysis_stats", {})
-            malicious_count = stats.get("malicious", 0)
-            logger.info(f"[VT] analysis result for {url}: malicious={malicious_count}")
-            return malicious_count > 0
+            attrs = resp.json().get("data", {}).get("attributes", {})
+            status = attrs.get("status")
+            if status == "completed":
+                stats = attrs.get("stats", {})
+                malicious = stats.get("malicious", 0) > 0
+                logger.info(f"[VT] analysis completed for {url}: malicious={malicious}")
+                return malicious
+            else:
+                logger.info(f"[VT] analysis {status} for {url}, retrying...")
+        else:
+            logger.warning(f"[!] VT analysis check failed ({resp.status_code}) for {url}")
+            break
+        time.sleep(5)
 
-        # Log 404s explicitly
-        if resp.status_code == 404:
-            logger.info(f"[VT] no record for {url} (404); treating as clean")
-            return False
-
-        # Other errors
-        logger.warning(f"[VT] unexpected status {resp.status_code} for {url}")
-    except Exception as e:
-        logger.warning(f"[VT] error checking {url}: {e}")
+    logger.warning(f"[!] VT analysis timed out for {url}")
     return False
 
 
@@ -85,25 +88,19 @@ class AllInOne:
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # Serve CA cert
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
-                flow.response = http.Response.make(
-                    404, b"CA not found", {"Content-Type": "text/plain"}
-                )
+                flow.response = http.Response.make(404, b"CA not found", {"Content-Type": "text/plain"})
                 return
             with open(CA_PATH, "rb") as f:
                 cert = f.read()
             flow.response = http.Response.make(
-                200, cert,
-                {
-                    "Content-Type": "application/x-pem-file",
-                    "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem"
-                }
+                200,
+                cert,
+                {"Content-Type": "application/x-pem-file", "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem"}
             )
             return
 
-        # Block malicious URLs
         if BLOCK_MALICIOUS and is_malicious(url):
             logger.warning(f"[BLOCKED] {url}")
             flow.response = http.Response.make(
@@ -121,10 +118,8 @@ async def run_proxy():
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
     m = DumpMaster(opts)
     m.addons.add(AllInOne())
-
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
-
     logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
     await m.run()
 
