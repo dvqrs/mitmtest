@@ -42,7 +42,6 @@ def is_malicious(url: str) -> bool:
     headers = {"x-apikey": api_key}
     logger.info(f"[VT] submitting {url} with key ending ...{api_key[-6:]}")
 
-    # 1) Submit URL for analysis
     sub = requests.post(
         "https://www.virustotal.com/api/v3/urls",
         headers=headers,
@@ -57,8 +56,7 @@ def is_malicious(url: str) -> bool:
         logger.warning(f"[!] VT returned no analysis ID for {url}")
         return False
 
-    # 2) Poll analysis until complete
-    for attempt in range(12):  # ~1 minute max, 5s interval
+    for _ in range(12):  # ~1 minute max, 5s interval
         resp = requests.get(
             f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
             headers=headers,
@@ -66,14 +64,12 @@ def is_malicious(url: str) -> bool:
         )
         if resp.status_code == 200:
             attrs = resp.json().get("data", {}).get("attributes", {})
-            status = attrs.get("status")
-            if status == "completed":
+            if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {})
                 malicious = stats.get("malicious", 0) > 0
                 logger.info(f"[VT] analysis completed for {url}: malicious={malicious}")
                 return malicious
-            else:
-                logger.info(f"[VT] analysis {status} for {url}, retrying...")
+            logger.info(f"[VT] analysis {attrs.get('status')} for {url}, retrying...")
         else:
             logger.warning(f"[!] VT analysis check failed ({resp.status_code}) for {url}")
             break
@@ -88,6 +84,7 @@ class AllInOne:
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
+        # Always serve CA certificate if requested
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
                 flow.response = http.Response.make(404, b"CA not found", {"Content-Type": "text/plain"})
@@ -101,13 +98,16 @@ class AllInOne:
             )
             return
 
-        if BLOCK_MALICIOUS and is_malicious(url):
-            logger.warning(f"[BLOCKED] {url}")
-            flow.response = http.Response.make(
-                403,
-                b"<h1>403 Forbidden</h1><p>Blocked by MITM firewall.</p>",
-                {"Content-Type": "text/html"}
-            )
+        # Only scan top‑level page navigations (HTML GET requests)
+        accept = flow.request.headers.get("Accept", "")
+        if flow.request.method == "GET" and "text/html" in accept:
+            if BLOCK_MALICIOUS and is_malicious(url):
+                logger.warning(f"[BLOCKED] {url}")
+                flow.response = http.Response.make(
+                    403,
+                    b"<h1>403 Forbidden</h1><p>Blocked by MITM firewall.</p>",
+                    {"Content-Type": "text/html"}
+                )
 
     def response(self, flow: http.HTTPFlow):
         pass
