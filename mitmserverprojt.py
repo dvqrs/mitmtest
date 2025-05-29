@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-import os
-import signal
 import base64
 import logging
 import asyncio
 import itertools
-import time
-import requests
+import os
+import signal
+
+import httpx
 from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
@@ -24,105 +24,93 @@ VT_API_KEYS = [
     "16539b7c5e8140decd35a6110b00c5a794ee21f2bddb605e55e6c8c3e3ad6898",
     "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319",
 ]
+# Cycle through keys for each new scan
 _key_cycle = itertools.cycle(VT_API_KEYS)
+# Limit concurrent scans to number of keys
+scan_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
+# Block or allow unknown
 BLOCK_MALICIOUS = True
+# Path to mitmproxy CA
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
+# Shared HTTPX client for async VT requests
+vt_client = httpx.AsyncClient(timeout=15.0)
 
-def get_vt_api_key() -> str:
+async def get_vt_api_key() -> str:
     return next(_key_cycle)
 
-
-def is_malicious(url: str) -> bool:
-    """Submit URL for analysis and poll until complete, return True if malicious."""
-    api_key = get_vt_api_key()
-    headers = {"x-apikey": api_key}
-    logger.info(f"[VT] submitting {url} with key ending ...{api_key[-6:]}")
-
-    sub = requests.post(
-        "https://www.virustotal.com/api/v3/urls",
-        headers=headers,
-        data={"url": url},
-        timeout=10
-    )
-    if sub.status_code != 200:
-        logger.warning(f"[!] VT submission failed ({sub.status_code}) for {url}")
-        return False
-    analysis_id = sub.json().get("data", {}).get("id")
-    if not analysis_id:
-        logger.warning(f"[!] VT returned no analysis ID for {url}")
-        return False
-
-    for _ in range(12):  # ~1 minute max, 5s interval
-        resp = requests.get(
-            f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+async def scan_url(url: str) -> bool:
+    """
+    Submit URL to VT and poll until analysis completes.
+    Runs under a semaphore to allow parallel scans up to key count.
+    """
+    async with scan_semaphore:
+        api_key = await get_vt_api_key()
+        headers = {"x-apikey": api_key}
+        logger.info(f"[VT] POST /urls for {url} with key ...{api_key[-6:]}")
+        post = await vt_client.post(
+            "https://www.virustotal.com/api/v3/urls",
             headers=headers,
-            timeout=10
+            data={"url": url}
         )
-        if resp.status_code == 200:
-            attrs = resp.json().get("data", {}).get("attributes", {})
-            if attrs.get("status") == "completed":
-                stats = attrs.get("stats", {})
-                malicious = stats.get("malicious", 0) > 0
-                logger.info(f"[VT] analysis completed for {url}: malicious={malicious}")
-                return malicious
-            logger.info(f"[VT] analysis {attrs.get('status')} for {url}, retrying...")
-        else:
-            logger.warning(f"[!] VT analysis check failed ({resp.status_code}) for {url}")
-            break
-        time.sleep(5)
+        if post.status_code != 200:
+            logger.warning(f"[!] VT POST failed {post.status_code} for {url}")
+            return False
+        analysis_id = post.json().get("data", {}).get("id")
+        if not analysis_id:
+            return False
 
-    logger.warning(f"[!] VT analysis timed out for {url}")
-    return False
-
+        # Poll analysis endpoint
+        for _ in range(10):
+            get = await vt_client.get(f"https://www.virustotal.com/api/v3/analyses/{analysis_id}", headers=headers)
+            if get.status_code == 200:
+                attrs = get.json().get("data", {}).get("attributes", {})
+                if attrs.get("status") == "completed":
+                    stats = attrs.get("stats", {})
+                    malicious = stats.get("malicious", 0) > 0
+                    logger.info(f"[VT] completed {url}: malicious={malicious}")
+                    return malicious
+            await asyncio.sleep(5)
+        logger.warning(f"[!] VT scan timeout for {url}")
+        return False
 
 class AllInOne:
-    def request(self, flow: http.HTTPFlow):
+    async def request(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # Always serve CA certificate if requested
+        # serve CA cert
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
-                flow.response = http.Response.make(404, b"CA not found", {"Content-Type": "text/plain"})
+                flow.response = http.Response.make(404, b"CA not found")
                 return
-            with open(CA_PATH, "rb") as f:
-                cert = f.read()
-            flow.response = http.Response.make(
-                200,
-                cert,
-                {"Content-Type": "application/x-pem-file", "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem"}
-            )
+            cert = open(CA_PATH, "rb").read()
+            flow.response = http.Response.make(200, cert, {"Content-Type": "application/x-pem-file"})
             return
 
-        # Only scan top‑level page navigations (HTML GET requests)
-        accept = flow.request.headers.get("Accept", "")
-        if flow.request.method == "GET" and "text/html" in accept:
-            if BLOCK_MALICIOUS and is_malicious(url):
-                logger.warning(f"[BLOCKED] {url}")
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked by MITM firewall.</p>",
-                    {"Content-Type": "text/html"}
-                )
+        # only scan top-level HTML GETs
+        if flow.request.method == "GET" and "text/html" in flow.request.headers.get("Accept", ""):
+            if BLOCK_MALICIOUS:
+                # schedule scan and await result concurrently
+                malicious = await scan_url(url)
+                if malicious:
+                    flow.response = http.Response.make(403, b"Blocked by VT", {"Content-Type": "text/html"})
 
-    def response(self, flow: http.HTTPFlow):
-        pass
+def start_proxy():
+    asyncio.run(_run())
 
-
-async def run_proxy():
-    loop = asyncio.get_running_loop()
+async def _run():
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
     m = DumpMaster(opts)
     m.addons.add(AllInOne())
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
-    logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
+    logger.info(f"[*] Mitmproxy on port {MITM_PORT}")
     await m.run()
 
-
 if __name__ == "__main__":
-    asyncio.run(run_proxy())
+    start_proxy()
