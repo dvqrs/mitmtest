@@ -4,7 +4,6 @@ import signal
 import base64
 import logging
 import asyncio
-import random
 import itertools
 
 import requests
@@ -48,27 +47,36 @@ def get_vt_api_key() -> str:
 def is_malicious(url: str) -> bool:
     """Query VirusTotal for the URL; return True if flagged malicious."""
     try:
+        api_key = get_vt_api_key()
+        # Log which key and URL we're checking
+        logger.info(f"[VT] using key ending with ...{api_key[-6:]} to check {url}")
+
         # VT expects a URL ID encoded in base64 without padding
         url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
-        api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
         resp = requests.get(
             f"https://www.virustotal.com/api/v3/urls/{url_id}",
             headers=headers,
             timeout=10
         )
+
         if resp.status_code == 200:
             stats = resp.json().get("data", {}) \
                                .get("attributes", {}) \
                                .get("last_analysis_stats", {})
-            return stats.get("malicious", 0) > 0
-        elif resp.status_code == 404:
-            # URL not seen by VT → assume not malicious
+            malicious_count = stats.get("malicious", 0)
+            logger.info(f"[VT] analysis result for {url}: malicious={malicious_count}")
+            return malicious_count > 0
+
+        # Log 404s explicitly
+        if resp.status_code == 404:
+            logger.info(f"[VT] no record for {url} (404); treating as clean")
             return False
-        else:
-            logger.warning(f"[!] VT responded {resp.status_code} for URL {url}")
+
+        # Other errors
+        logger.warning(f"[VT] unexpected status {resp.status_code} for {url}")
     except Exception as e:
-        logger.warning(f"[!] VT check error: {e}")
+        logger.warning(f"[VT] error checking {url}: {e}")
     return False
 
 
