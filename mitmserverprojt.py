@@ -7,6 +7,7 @@ import os
 import signal
 import time
 import requests
+from urllib.parse import urlparse
 from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
@@ -24,10 +25,12 @@ VT_API_KEYS = [
     "16539b7c5e8140decd35a6110b00c5a794ee21f2bddb605e55e6c8c3e3ad6898",
     "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319",
 ]
-# Round-robin iterator for keys\_key
+# Round-robin iterator for keys and semaphore to limit concurrency
 _key_cycle = itertools.cycle(VT_API_KEYS)
-# Limit concurrent scans to number of keys\_sem
 scan_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
+# Cache results per domain to avoid repeated scans
+_domain_cache = {}
+
 BLOCK_MALICIOUS = True
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
@@ -39,29 +42,29 @@ def get_vt_api_key() -> str:
     return next(_key_cycle)
 
 
-def sync_scan_url(url: str) -> bool:
-    """Sync VT submit-and-poll; to be run in executor."""
+def sync_scan_domain(domain: str) -> bool:
+    """Sync VT submit-and-poll for a domain."""
     api_key = get_vt_api_key()
     headers = {"x-apikey": api_key}
-    logger.info(f"[VT] POST /urls for {url} with key ...{api_key[-6:]}")
+    logger.info(f"[VT] POST /urls for domain {domain} with key ...{api_key[-6:]}")
     try:
         post = requests.post(
             "https://www.virustotal.com/api/v3/urls",
             headers=headers,
-            data={"url": url},
+            data={"url": domain},
             timeout=15
         )
     except Exception as e:
-        logger.warning(f"[!] VT POST error for {url}: {e}")
+        logger.warning(f"[!] VT POST error for {domain}: {e}")
         return False
     if post.status_code != 200:
-        logger.warning(f"[!] VT POST failed {post.status_code} for {url}")
+        logger.warning(f"[!] VT POST failed {post.status_code} for {domain}")
         return False
     analysis_id = post.json().get("data", {}).get("id")
     if not analysis_id:
         return False
 
-    for _ in range(10):
+    for _ in range(10):  # poll up to ~50s
         try:
             get = requests.get(
                 f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
@@ -69,29 +72,31 @@ def sync_scan_url(url: str) -> bool:
                 timeout=15
             )
         except Exception as e:
-            logger.warning(f"[!] VT GET error for {url}: {e}")
+            logger.warning(f"[!] VT GET error for {domain}: {e}")
             break
         if get.status_code == 200:
             attrs = get.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {})
                 malicious = stats.get("malicious", 0) > 0
-                logger.info(f"[VT] completed {url}: malicious={malicious}")
+                logger.info(f"[VT] analysis for {domain} completed: malicious={malicious}")
                 return malicious
         else:
-            logger.warning(f"[!] VT GET failed {get.status_code} for {url}")
+            logger.warning(f"[!] VT GET failed {get.status_code} for {domain}")
             break
         time.sleep(5)
 
-    logger.warning(f"[!] VT scan timeout for {url}")
+    logger.warning(f"[!] VT scan timeout for {domain}")
     return False
 
-async def scan_url(url: str) -> bool:
-    """
-    Run sync_scan_url in thread pool under semaphore.
-    """
+async def scan_domain(domain: str) -> bool:
+    """Async wrapper for sync_scan_domain, with concurrency control and caching."""
+    if domain in _domain_cache:
+        return _domain_cache[domain]
     async with scan_semaphore:
-        return await asyncio.get_event_loop().run_in_executor(None, sync_scan_url, url)
+        result = await asyncio.get_event_loop().run_in_executor(None, sync_scan_domain, domain)
+    _domain_cache[domain] = result
+    return result
 
 class AllInOne:
     async def request(self, flow: http.HTTPFlow):
@@ -112,16 +117,16 @@ class AllInOne:
             )
             return
 
-        # Only scan top-level HTML GETs
+        # Only scan top-level HTML GET requests
         if flow.request.method == "GET" and "text/html" in flow.request.headers.get("Accept", ""):
-            if BLOCK_MALICIOUS:
-                malicious = await scan_url(url)
-                if malicious:
-                    flow.response = http.Response.make(
-                        403,
-                        b"<h1>403 Forbidden</h1><p>Blocked by VT</p>",
-                        {"Content-Type": "text/html"}
-                    )
+            parsed = urlparse(url)
+            domain = f"{parsed.scheme}://{parsed.netloc}/"
+            if BLOCK_MALICIOUS and await scan_domain(domain):
+                flow.response = http.Response.make(
+                    403,
+                    b"<h1>403 Forbidden</h1><p>Blocked by VT</p>",
+                    {"Content-Type": "text/html"}
+                )
 
     def response(self, flow: http.HTTPFlow):
         pass
