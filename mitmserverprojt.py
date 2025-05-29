@@ -15,21 +15,16 @@ from mitmproxy.tools.dump import DumpMaster
 # ─────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────
-MITM_PORT = int(os.getenv("MITM_PORT", 8443))
+MITM_PORT = 8443
 
-# List your VT API keys here (set via environment or hardcoded)
+# Hardcoded VirusTotal API keys
 VT_API_KEYS = [
-    os.getenv("VT_API_KEY1", "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416"),
-    os.getenv("VT_API_KEY2", "b7b3510d6136926eb092d853ea0968ca0f0df2228fdb2e302e25ea113520aca0"),
-    os.getenv("VT_API_KEY3", "6e5281c4f459d5192fc42c9282ca94228c535e2329c2f3dda676cc61286cb91e"),
-    os.getenv("VT_API_KEY4", "16539b7c5e8140decd35a6110b00c5a794ee21f2bddb605e55e6c8c3e3ad6898"),
-    os.getenv("VT_API_KEY5", "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319"),
+    "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416",
+    "b7b3510d6136926eb092d853ea0968ca0f0df2228fdb2e302e25ea113520aca0",
+    "6e5281c4f459d5192fc42c9282ca94228c535e2329c2f3dda676cc61286cb91e",
+    "16539b7c5e8140decd35a6110b00c5a794ee21f2bddb605e55e6c8c3e3ad6898",
+    "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319",
 ]
-
-# Filter out empty keys
-VT_API_KEYS = [key for key in VT_API_KEYS if key]
-if not VT_API_KEYS:
-    raise RuntimeError("No VirusTotal API keys configured")
 
 # Create a cycling iterator to rotate keys on each use
 _key_cycle = itertools.cycle(VT_API_KEYS)
@@ -53,6 +48,7 @@ def get_vt_api_key() -> str:
 def is_malicious(url: str) -> bool:
     """Query VirusTotal for the URL; return True if flagged malicious."""
     try:
+        # VT expects a URL ID encoded in base64 without padding
         url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
         api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
@@ -66,6 +62,9 @@ def is_malicious(url: str) -> bool:
                                .get("attributes", {}) \
                                .get("last_analysis_stats", {})
             return stats.get("malicious", 0) > 0
+        elif resp.status_code == 404:
+            # URL not seen by VT → assume not malicious
+            return False
         else:
             logger.warning(f"[!] VT responded {resp.status_code} for URL {url}")
     except Exception as e:
