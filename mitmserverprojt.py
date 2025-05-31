@@ -20,6 +20,9 @@ from mitmproxy.tools.dump import DumpMaster
 
 MITM_PORT = 8443
 
+# Path to mitmproxy's CA cert
+CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+
 # EICAR test file bytes
 EICAR_BYTES = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
