@@ -52,6 +52,11 @@ FILE_CACHE_TTL = 3600  # 1 hour
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
 
+# Extensions for static assets to skip domain and file checks
+SKIP_STATIC_EXTS = (
+    ".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".webp"
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
@@ -186,7 +191,7 @@ class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        Handle EICAR, then perform domain reputation checks.
+        Handle EICAR, skip WebSocket and static assets, then perform domain reputation checks.
         """
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
@@ -203,13 +208,17 @@ class AllInOne:
             )
             return
 
-        # 2) Skip domain check for .ico files
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        if path.endswith(".ico"):
+        # 2) Skip WebSocket upgrade requests
+        if flow.request.headers.get("Upgrade", "").lower() == "websocket":
             return
 
-        # 3) Serve the Mitmproxy CA if requested
+        # 3) Skip domain check for static assets
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if path.endswith(SKIP_STATIC_EXTS):
+            return
+
+        # 4) Serve the Mitmproxy CA if requested
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
                 flow.response = http.Response.make(
@@ -228,7 +237,7 @@ class AllInOne:
             )
             return
 
-        # 4) Domain reputation check (async)
+        # 5) Domain reputation check (async)
         domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
@@ -239,7 +248,7 @@ class AllInOne:
             )
             return
 
-        # 5) (Optional) Inspect POST payloads for SQLi etc.
+        # 6) (Optional) Inspect POST payloads for SQLi etc.
 
     async def response(self, flow: http.HTTPFlow):
         """
@@ -254,8 +263,8 @@ class AllInOne:
 
         path = urlparse(url).path.lower()
 
-        # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .gif
-        skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif")
+        # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .gif, .webp
+        skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".webp")
         if path.endswith(skip_exts):
             return
 
