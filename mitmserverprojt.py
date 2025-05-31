@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import base64
 import logging
 import asyncio
 import itertools
@@ -7,17 +6,24 @@ import os
 import signal
 import time
 import requests
+import ipaddress
+import re
 from urllib.parse import urlparse
+
 from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
-# ─────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
 MITM_PORT = 8443
 
-# Hardcoded VirusTotal API keys (rotate through them)
+# EICAR test file bytes
+EICAR_BYTES = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+
+# VirusTotal API keys (rotate through them)
 VT_API_KEYS = [
     "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416",
     "b7b3510d6136926eb092d853ea0968ca0f0df2228fdb2e302e25ea113520aca0",
@@ -26,104 +32,129 @@ VT_API_KEYS = [
     "0f53125a357dcffafb064976bfac2c47d3e20181720dc0d391ad7bf83608d319",
 ]
 _key_cycle = itertools.cycle(VT_API_KEYS)
-scan_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
+# Semaphores to limit concurrent VT API calls
+file_scan_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
+domain_check_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
 
-# Cache results per domain to avoid repeated lookups
+# Cache for domain reputations
 _domain_cache = {}
 CACHE_TTL = 3600  # 1 hour
 _cache_timestamps = {}
 
-# Cache for file scans? (Optional: you can keep a short‐term cache of hashes)
+# Cache for file-scan results (by SHA256)
 _file_cache = {}
 _file_cache_timestamps = {}
-FILE_CACHE_TTL = 3600
+FILE_CACHE_TTL = 3600  # 1 hour
 
-# Block flags
+# Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
-# MITM CA path (to serve it on /mitmproxy-ca-cert.pem)
-CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
+
 def get_vt_api_key() -> str:
-    """Round‐robin selection of VT API key."""
+    """Round-robin selection of a VT API key."""
     return next(_key_cycle)
 
-def is_domain_malicious(domain: str) -> bool:
-    """
-    Query VT domain endpoint and return True if any engine flags malicious.
-    Uses a simple in‐memory TTL cache.
-    """
-    now = time.time()
-    if domain in _domain_cache:
-        age = now - _cache_timestamps.get(domain, 0)
-        if age < CACHE_TTL:
-            return _domain_cache[domain]
 
-    api_key = get_vt_api_key()
-    headers = {"x-apikey": api_key}
-    url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+def is_private_or_localhost(hostname: str) -> bool:
+    """
+    Return True if `hostname` is 'localhost' or a private-network IP.
+    Used to skip VT lookups on those.
+    """
+    hn = hostname.lower().split(":", 1)[0]
+    if hn == "localhost":
+        return True
     try:
-        logger.info(f"[VT] Checking domain reputation: {domain} (key …{api_key[-6:]})")
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        stats = data.get("attributes", {}).get("last_analysis_stats", {})
-        malicious = stats.get("malicious", 0) > 0
-        _domain_cache[domain] = malicious
-        _cache_timestamps[domain] = now
-        logger.info(f"[VT] Domain {domain} → malicious={malicious}")
-        return malicious
-    except Exception as e:
-        logger.warning(f"[VT] error checking domain {domain}: {e}")
-        # If VT fails, default to “not malicious” (risky choice)
+        ip = ipaddress.ip_address(hn)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
         return False
+
+
+async def is_domain_malicious(domain: str) -> bool:
+    """
+    Asynchronously query VT domain endpoint; return True if malicious.
+    Skip VT if domain is private or localhost.
+    """
+    if is_private_or_localhost(domain):
+        return False
+
+    domain_to_check = domain.split(":", 1)[0]
+    now = time.time()
+    if domain_to_check in _domain_cache:
+        age = now - _cache_timestamps.get(domain_to_check, 0)
+        if age < CACHE_TTL:
+            return _domain_cache[domain_to_check]
+
+    async with domain_check_semaphore:
+        api_key = get_vt_api_key()
+        headers = {"x-apikey": api_key}
+        url = f"https://www.virustotal.com/api/v3/domains/{domain_to_check}"
+        try:
+            logger.info(f"[VT] Checking domain reputation: {domain_to_check} (key …{api_key[-6:]})")
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: requests.get(url, headers=headers, timeout=10)
+            )
+            r.raise_for_status()
+            data = r.json().get("data", {})
+            stats = data.get("attributes", {}).get("last_analysis_stats", {})
+            malicious = stats.get("malicious", 0) > 0
+            _domain_cache[domain_to_check] = malicious
+            _cache_timestamps[domain_to_check] = now
+            logger.info(f"[VT] Domain {domain_to_check} → malicious={malicious}")
+            return malicious
+        except Exception as e:
+            logger.warning(f"[VT] error checking domain {domain_to_check}: {e}")
+            return False
+
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    Submit the binary payload to VT’s file‐scan endpoint, wait for analysis,
-    and return True if VT flags it malicious. Uses in‐memory cache by SHA256.
+    Submit binary to VT's file-scan endpoint, poll until analysis,
+    return True if VT flags it malicious. Uses SHA256 cache.
     """
     import hashlib
 
     sha256 = hashlib.sha256(content_bytes).hexdigest()
     now = time.time()
-    # Use cache if we scanned this exact file (by hash) recently
     if sha256 in _file_cache:
         age = now - _file_cache_timestamps.get(sha256, 0)
         if age < FILE_CACHE_TTL:
             return _file_cache[sha256]
 
-    # Acquire a semaphore token (so we don’t exceed number of keys)
-    async with scan_semaphore:
+    async with file_scan_semaphore:
         api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
-        files = {"file": ("upload.bin", content_bytes)}
+        files = {"file": ("file", content_bytes)}
         try:
             logger.info(f"[VT] Uploading file (sha256={sha256[:10]}…) for scan (key …{api_key[-6:]})")
-            upload_resp = requests.post(
-                "https://www.virustotal.com/api/v3/files",
-                headers=headers,
-                files=files,
-                timeout=30
+            upload_resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(
+                    "https://www.virustotal.com/api/v3/files",
+                    headers=headers,
+                    files=files,
+                    timeout=30
+                )
             )
             upload_resp.raise_for_status()
             analysis_id = upload_resp.json()["data"]["id"]
         except Exception as e:
             logger.warning(f"[VT] file upload error: {e}")
-            # Treat as “not malicious” on upload failure (you could also choose to block)
             _file_cache[sha256] = False
             _file_cache_timestamps[sha256] = now
             return False
 
-    # Poll for analysis results
     vt_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
     while True:
         try:
-            time.sleep(2)  # wait a bit before polling
+            time.sleep(2)
             headers = {"x-apikey": api_key}
-            r = requests.get(vt_url, headers=headers, timeout=10)
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: requests.get(vt_url, headers=headers, timeout=10)
+            )
             r.raise_for_status()
             j = r.json()
             status = j.get("data", {}).get("attributes", {}).get("status")
@@ -137,7 +168,6 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
                 _file_cache_timestamps[sha256] = now
                 return malicious
             else:
-                # Unexpected status; break and treat as not malicious
                 logger.warning(f"[VT] Unexpected file analysis status: {status}")
                 _file_cache[sha256] = False
                 _file_cache_timestamps[sha256] = now
@@ -148,16 +178,35 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             _file_cache_timestamps[sha256] = now
             return False
 
+
 class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        We already check domain reputation here; you could also inspect request payloads.
+        Handle EICAR, then perform domain reputation checks.
         """
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # If client explicitly requests the CA, serve it (same as before)
+        # 1) If the client asked for http://eicar.invalid/eicar.com, serve EICAR
+        if url.lower() == "http://eicar.invalid/eicar.com":
+            flow.response = http.Response.make(
+                200,
+                EICAR_BYTES,
+                {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Disposition": "attachment; filename=eicar.com",
+                },
+            )
+            return
+
+        # 2) Skip domain check for .ico files
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if path.endswith(".ico"):
+            return
+
+        # 3) Serve the Mitmproxy CA if requested
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
                 flow.response = http.Response.make(
@@ -176,10 +225,9 @@ class AllInOne:
             )
             return
 
-        # Domain‐based blocking (as before)
-        parsed = urlparse(url)
+        # 4) Domain reputation check (async)
         domain = parsed.netloc.lower()
-        malicious_domain = is_domain_malicious(domain)
+        malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
             flow.response = http.Response.make(
                 403,
@@ -188,32 +236,12 @@ class AllInOne:
             )
             return
 
-        # OPTIONAL: Inspect the request body for suspicious patterns
-        # (e.g. SQLi or JS payload). Here’s an example regex check:
-        ctype_req = flow.request.headers.get("Content-Type", "").lower()
-        if flow.request.method == "POST" and "application/x-www-form-urlencoded" in ctype_req:
-            # Get the raw text (forms):
-            try:
-                text_req = flow.request.get_text(strict=False)
-            except ValueError:
-                text_req = ""
-            # Simple example: block if SQL‐injection patterns appear
-            import re
-            if re.search(r"(?:')|(?:--)|(/\\*)|(\\*/)|(;)", text_req):
-                logger.warning(f"[REQUEST] Possible SQL‐i payload in {url}")
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked suspicious request payload</p>",
-                    {"Content-Type": "text/html"},
-                )
-                return
-        # Otherwise, let the request proceed to the server
-        # (i.e. do nothing, mitmproxy will forward it)
+        # 5) (Optional) Inspect POST payloads for SQLi etc.
 
     async def response(self, flow: http.HTTPFlow):
         """
         Called on every server → proxy → client response.
-        Here we inspect the response content to detect malicious payloads.
+        Check CSS, JS, and binaries.
         """
         if flow.response is None:
             return
@@ -221,47 +249,53 @@ class AllInOne:
         url = flow.request.pretty_url
         logger.info(f"[RESPONSE] {url}")
 
-        # 1) Inspect response HTTP headers
-        ctype = flow.response.headers.get("Content-Type", "").lower()
-        # If it’s an HTML page, you might scan for embedded malicious JavaScript:
-        if "text/html" in ctype or "application/javascript" in ctype:
-            try:
-                text_resp = flow.response.get_text(strict=False)
-            except ValueError:
-                text_resp = ""
-            # Example: look for extremely obfuscated JS (e.g. eval(base64_decode(…)) )
-            import re
-            if re.search(r"eval\(.*base64_decode", text_resp):
-                logger.warning(f"[RESPONSE] Suspicious obfuscated JS in {url}")
-                if BLOCK_MALICIOUS:
-                    flow.response = http.Response.make(
-                        403,
-                        b"<h1>403 Forbidden</h1><p>Blocked obfuscated JavaScript</p>",
-                        {"Content-Type": "text/html"},
-                    )
-                    return
+        path = urlparse(url).path.lower()
 
-        # 2) If it’s a binary download (e.g. EXE, DLL, PDF, ZIP, application/octet-stream), submit to VT
+        # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .gif
+        skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif")
+        if path.endswith(skip_exts):
+            return
+
+        # CSS files: do heuristic scan (e.g. large or suspicious patterns)
+        if path.endswith(".css"):
+            text = flow.response.get_text(strict=False)
+            if len(text) > 100 * 1024 or "url(data:" in text or "expression(" in text:
+                flow.response = http.Response.make(
+                    403,
+                    b"<h1>403 Forbidden</h1><p>Blocked suspicious CSS</p>",
+                    {"Content-Type": "text/html"},
+                )
+            return
+
+        # JS files: check for obfuscation or suspicious constructs
+        if path.endswith(".js"):
+            text = flow.response.get_text(strict=False)
+            # Simple heuristics: eval(atob, large single-line, or remote script tags
+            if "eval(atob" in text or re.search(r"https?://[^"]+", text) or len(text) > 500 * 1024:
+                flow.response = http.Response.make(
+                    403,
+                    b"<h1>403 Forbidden</h1><p>Blocked suspicious JavaScript</p>",
+                    {"Content-Type": "text/html"},
+                )
+            return
+
+        # Binary files: PDF, ZIP, EXE, etc. → full VT file scan
+        ctype = flow.response.headers.get("Content-Type", "").lower()
         binary_types = [
             "application/octet-stream",
             "application/pdf",
             "application/zip",
-            "application/x-msdownload",  # .exe
-            "application/x-msdos‐program", 
-            "application/vnd.microsoft.portable‐executable",
+            "application/x-msdownload",
+            "application/vnd.microsoft.portable-executable",
         ]
         if any(bt in ctype for bt in binary_types):
-            # Grab the raw bytes
             raw_data = flow.response.raw_content
-            # Check cache + scan
             try:
                 malicious_file = await is_file_malicious(raw_data)
             except Exception as e:
                 logger.warning(f"[RESPONSE] file scanning error: {e}")
                 malicious_file = False
             if BLOCK_MALICIOUS and malicious_file:
-                logger.warning(f"[RESPONSE] Blocking malicious file from {url}")
-                # Replace the body with a 403 page
                 flow.response = http.Response.make(
                     403,
                     b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
@@ -269,8 +303,8 @@ class AllInOne:
                 )
                 return
 
-        # 3) Otherwise, let the clean response pass through
-        # No modification means mitmproxy will forward it as‐is.
+        # HTML pages: one could scan inline scripts or references, but skip for brevity
+        # Everything else passes through
 
 async def run_proxy():
     loop = asyncio.get_running_loop()
