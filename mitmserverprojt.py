@@ -57,6 +57,12 @@ SKIP_STATIC_EXTS = (
     ".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".webp"
 )
 
+# Domains to completely bypass scanning (e.g., trusted web services)
+TRUSTED_DOMAINS = (
+    "whatsapp.com",
+    "google.com",
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
@@ -81,12 +87,21 @@ def is_private_or_localhost(hostname: str) -> bool:
         return False
 
 
+def is_trusted_domain(domain: str) -> bool:
+    """
+    Return True if the domain ends with any entry in TRUSTED_DOMAINS.
+    """
+    for td in TRUSTED_DOMAINS:
+        if domain.endswith(td):
+            return True
+    return False
+
 async def is_domain_malicious(domain: str) -> bool:
     """
     Asynchronously query VT domain endpoint; return True if malicious.
-    Skip VT if domain is private or localhost.
+    Skip VT if domain is private, localhost, or trusted.
     """
-    if is_private_or_localhost(domain):
+    if is_private_or_localhost(domain) or is_trusted_domain(domain):
         return False
 
     domain_to_check = domain.split(":", 1)[0]
@@ -116,7 +131,6 @@ async def is_domain_malicious(domain: str) -> bool:
         except Exception as e:
             logger.warning(f"[VT] error checking domain {domain_to_check}: {e}")
             return False
-
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
@@ -186,7 +200,6 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             _file_cache_timestamps[sha256] = now
             return False
 
-
 class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
@@ -212,10 +225,11 @@ class AllInOne:
         if flow.request.headers.get("Upgrade", "").lower() == "websocket":
             return
 
-        # 3) Skip domain check for static assets
+        # 3) Skip domain check for static assets or trusted domains
         parsed = urlparse(url)
+        domain = parsed.netloc.lower()
         path = parsed.path.lower()
-        if path.endswith(SKIP_STATIC_EXTS):
+        if is_trusted_domain(domain) or path.endswith(SKIP_STATIC_EXTS):
             return
 
         # 4) Serve the Mitmproxy CA if requested
@@ -238,7 +252,6 @@ class AllInOne:
             return
 
         # 5) Domain reputation check (async)
-        domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
             flow.response = http.Response.make(
@@ -261,7 +274,13 @@ class AllInOne:
         url = flow.request.pretty_url
         logger.info(f"[RESPONSE] {url}")
 
-        path = urlparse(url).path.lower()
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        path = parsed.path.lower()
+
+        # Skip for trusted domains
+        if is_trusted_domain(domain):
+            return
 
         # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .gif, .webp
         skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif", ".webp")
