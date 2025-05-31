@@ -271,7 +271,7 @@ class AllInOne:
         if path.endswith(".js"):
             text = flow.response.get_text(strict=False)
             # Simple heuristics: eval(atob, large single-line, or remote script tags
-            if "eval(atob" in text or re.search(r"https?://[^"]+", text) or len(text) > 500 * 1024:
+            if "eval(atob" in text or re.search(r'https?://[^"\s]+', text) or len(text) > 500 * 1024:
                 flow.response = http.Response.make(
                     403,
                     b"<h1>403 Forbidden</h1><p>Blocked suspicious JavaScript</p>",
