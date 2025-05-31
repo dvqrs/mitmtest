@@ -60,7 +60,9 @@ SKIP_STATIC_EXTS = (
 # Domains to completely bypass scanning (e.g., trusted web services)
 TRUSTED_DOMAINS = (
     "whatsapp.com",
+    "whatsapp.net",
     "google.com",
+    "gstatic.com",
 )
 
 logging.basicConfig(level=logging.INFO)
