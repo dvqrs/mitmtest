@@ -44,7 +44,7 @@ _domain_cache = {}
 CACHE_TTL = 3600  # 1 hour
 _cache_timestamps = {}
 
-# Cache for file–scan results (by SHA256)
+# Cache for file‐scan results (by SHA256)
 _file_cache = {}
 _file_cache_timestamps = {}
 FILE_CACHE_TTL = 3600  # 1 hour
@@ -52,18 +52,26 @@ FILE_CACHE_TTL = 3600  # 1 hour
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
 
+# ──────────────────────────────────────────────────────────────────────────────
+# NEW: Domains to ignore for EICAR downloads (skip any VT scanning on these)
+IGNORED_FILE_DOMAINS = [
+    "eicar.org",        # canonical EICAR test site
+    # add additional hosts here, e.g. "mmg.whatsapp.net"
+]
+# ──────────────────────────────────────────────────────────────────────────────
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
 
 def get_vt_api_key() -> str:
-    """Round-robin selection of a VT API key."""
+    """Round‐robin selection of a VT API key."""
     return next(_key_cycle)
 
 
 def is_private_or_localhost(hostname: str) -> bool:
     """
-    Return True if `hostname` is 'localhost' or a private-network IP.
+    Return True if `hostname` is 'localhost' or a private‐network IP.
     Used to skip VT lookups on those.
     """
     hn = hostname.lower().split(":", 1)[0]
@@ -273,14 +281,17 @@ class AllInOne:
           - Small response skipping
           - File download pattern detection (including .com)
           - Extended binary detection
-          - Debug logs for first bytes and headers
-          - Unzip‐if‐needed logic for ZIP wrappers
-          - File-scan with VT “query-then-upload”
+          - GZIP‐decompression for wrapper flows
+          - Skip VT scanning if the response’s domain is in IGNORED_FILE_DOMAINS
+          - In‐memory ZIP detection & unwrapping
+          - File‐scan with VT “query‐then‐upload”
         """
         if flow.response is None:
             return
 
         url = flow.request.pretty_url
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
         logger.info(f"[RESPONSE] {url}")
 
         # Skip CA certificate serving
@@ -291,11 +302,28 @@ class AllInOne:
         if len(flow.response.raw_content) < 50:
             return
 
-        # Log first 64 bytes and relevant headers for debugging
+        # If this domain is in the ignore list, skip file scanning entirely:
+        if domain in IGNORED_FILE_DOMAINS:
+            logger.info(f"[BYPASS] Skipping VT scan for domain: {domain}")
+            return
+
+        # Log first 64 bytes and headers for debugging
         sample = flow.response.raw_content[:64]
         logger.info(f"[DEBUG] First 64 bytes of content: {sample!r}")
         logger.info(f"[DEBUG] Content-Type: {flow.response.headers.get('Content-Type')}")
         logger.info(f"[DEBUG] Content-Disposition: {flow.response.headers.get('Content-Disposition')}")
+
+        # If the response is GZIP‐wrapped (protobuf, JSON, etc.), decompress before scanning:
+        raw = flow.response.raw_content
+        if raw[:3] == b"\x1f\x8b\x08":
+            try:
+                import gzip
+                decompressed = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+                raw = decompressed
+                logger.info("[DEBUG] Decompressed GZIP wrapper")
+            except Exception:
+                # If decompression fails, just continue scanning the original raw bytes
+                pass
 
         parsed = urlparse(url)
         path = parsed.path.lower()
@@ -320,25 +348,21 @@ class AllInOne:
 
         # 3. If it looks like a file, handle potential ZIP wrapper and scan
         if is_download or is_binary:
-            raw = flow.response.raw_content
-
             # Detect ZIP magic header (PK\x03\x04)
-            if raw[:4] == b'PK\x03\x04':
+            if raw[:4] == b"PK\x03\x04":
                 try:
                     z = zipfile.ZipFile(io.BytesIO(raw))
-                    # Assume the first entry is the file we want (e.g., eicar.com)
+                    # Assume the first entry is our file (e.g., eicar.com)
                     inner_name = z.namelist()[0]
                     inner_bytes = z.read(inner_name)
                     inner_sha256 = hashlib.sha256(inner_bytes).hexdigest()
                     logger.info(f"[DEBUG] Unzipped '{inner_name}', inner SHA256: {inner_sha256}")
-
-                    # Scan the inner file bytes
                     malicious = await is_file_malicious(inner_bytes)
                 except Exception as exc:
                     logger.warning(f"[DEBUG] Failed to unzip; scanning raw instead: {exc}")
                     malicious = await is_file_malicious(raw)
             else:
-                # Not a ZIP—scan the raw bytes directly
+                # Not a ZIP—scan the raw (possibly decompressed) bytes directly
                 malicious = await is_file_malicious(raw)
 
             # If VT flags it malicious, block the response
@@ -364,3 +388,4 @@ async def run_proxy():
 
 if __name__ == "__main__":
     asyncio.run(run_proxy())
+
