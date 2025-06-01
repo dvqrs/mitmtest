@@ -8,6 +8,8 @@ import requests
 import ipaddress
 import re
 import hashlib
+import io
+import zipfile
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -42,7 +44,7 @@ _domain_cache = {}
 CACHE_TTL = 3600  # 1 hour
 _cache_timestamps = {}
 
-# Cache for file‐scan results (by SHA256)
+# Cache for file–scan results (by SHA256)
 _file_cache = {}
 _file_cache_timestamps = {}
 FILE_CACHE_TTL = 3600  # 1 hour
@@ -55,13 +57,13 @@ logger = logging.getLogger("mitmproxy")
 
 
 def get_vt_api_key() -> str:
-    """Round‐robin selection of a VT API key."""
+    """Round-robin selection of a VT API key."""
     return next(_key_cycle)
 
 
 def is_private_or_localhost(hostname: str) -> bool:
     """
-    Return True if `hostname` is 'localhost' or a private‐network IP.
+    Return True if `hostname` is 'localhost' or a private-network IP.
     Used to skip VT lookups on those.
     """
     hn = hostname.lower().split(":", 1)[0]
@@ -133,7 +135,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             logger.info(f"[VT] Cache hit for {sha256[:10]}… → malicious={_file_cache[sha256]}")
             return _file_cache[sha256]
 
-    # 2) Acquire semaphore so we don’t exceed your VT_API_KEYS rate
+    # 2) Acquire semaphore so we don’t exceed VT_API_KEYS rate
     async with file_scan_semaphore:
         api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
@@ -157,7 +159,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
                 return malicious
 
             if resp.status_code != 404:
-                # Some other error (rate limit? 403?), just log and treat as “not malicious”
+                # Some other error (rate limit? 403?), treat as “not malicious”
                 logger.warning(f"[VT] Unexpected status {resp.status_code} querying {file_info_url}")
                 _file_cache[sha256] = False
                 _file_cache_timestamps[sha256] = now
@@ -271,7 +273,9 @@ class AllInOne:
           - Small response skipping
           - File download pattern detection (including .com)
           - Extended binary detection
-          - File‐scan with VT “query‐then‐upload”
+          - Debug logs for first bytes and headers
+          - Unzip‐if‐needed logic for ZIP wrappers
+          - File-scan with VT “query-then-upload”
         """
         if flow.response is None:
             return
@@ -286,6 +290,12 @@ class AllInOne:
         # Skip small responses (<50 bytes)
         if len(flow.response.raw_content) < 50:
             return
+
+        # Log first 64 bytes and relevant headers for debugging
+        sample = flow.response.raw_content[:64]
+        logger.info(f"[DEBUG] First 64 bytes of content: {sample!r}")
+        logger.info(f"[DEBUG] Content-Type: {flow.response.headers.get('Content-Type')}")
+        logger.info(f"[DEBUG] Content-Disposition: {flow.response.headers.get('Content-Disposition')}")
 
         parsed = urlparse(url)
         path = parsed.path.lower()
@@ -308,23 +318,37 @@ class AllInOne:
             "video", "image"
         ])
 
-        # 3. If it looks like a file, compute SHA256, log it, and scan it
+        # 3. If it looks like a file, handle potential ZIP wrapper and scan
         if is_download or is_binary:
-            # Compute and log the SHA256 for debugging
-            sha256 = hashlib.sha256(flow.response.raw_content).hexdigest()
-            logger.info(f"[SCAN] Scanning file: {url} | SHA256={sha256} | Content-Type={ctype} | Download:{is_download}")
+            raw = flow.response.raw_content
 
-            try:
-                malicious = await is_file_malicious(flow.response.raw_content)
-                if malicious:
-                    logger.warning(f"[BLOCK] Malicious file blocked: {url} (SHA256={sha256})")
-                    flow.response = http.Response.make(
-                        403,
-                        b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
-                        {"Content-Type": "text/html"},
-                    )
-            except Exception as e:
-                logger.error(f"[ERROR] File scan failed for {url}: {e}")
+            # Detect ZIP magic header (PK\x03\x04)
+            if raw[:4] == b'PK\x03\x04':
+                try:
+                    z = zipfile.ZipFile(io.BytesIO(raw))
+                    # Assume the first entry is the file we want (e.g., eicar.com)
+                    inner_name = z.namelist()[0]
+                    inner_bytes = z.read(inner_name)
+                    inner_sha256 = hashlib.sha256(inner_bytes).hexdigest()
+                    logger.info(f"[DEBUG] Unzipped '{inner_name}', inner SHA256: {inner_sha256}")
+
+                    # Scan the inner file bytes
+                    malicious = await is_file_malicious(inner_bytes)
+                except Exception as exc:
+                    logger.warning(f"[DEBUG] Failed to unzip; scanning raw instead: {exc}")
+                    malicious = await is_file_malicious(raw)
+            else:
+                # Not a ZIP—scan the raw bytes directly
+                malicious = await is_file_malicious(raw)
+
+            # If VT flags it malicious, block the response
+            if malicious:
+                logger.warning(f"[BLOCK] Malicious file blocked: {url}")
+                flow.response = http.Response.make(
+                    403,
+                    b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
+                    {"Content-Type": "text/html"},
+                )
 
 
 async def run_proxy():
