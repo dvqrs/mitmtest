@@ -7,6 +7,7 @@ import signal
 import time
 import requests
 import ipaddress
+import re
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -19,8 +20,11 @@ from mitmproxy.tools.dump import DumpMaster
 
 MITM_PORT = 8443
 
-# Path to mitmproxy’s CA cert on disk (where mitmproxy generated it)
+# Path to mitmproxy's CA cert
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
+
+# EICAR test file bytes
+EICAR_BYTES = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
 # VirusTotal API keys (rotate through them)
 VT_API_KEYS = [
@@ -130,7 +134,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
         headers = {"x-apikey": api_key}
         files = {"file": ("file", content_bytes)}
 
-        # Log right before upload to VT
+        # Log right before the upload to VT.
         logger.info(f"[VT] → Uploading file to VT (sha256={sha256[:10]}…, key …{api_key[-6:]})")
         try:
             upload_resp = await asyncio.get_event_loop().run_in_executor(
@@ -189,60 +193,43 @@ class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        1) If path == /mitmproxy-ca-cert.pem, intercept and serve CA in response()
-        2) Otherwise, skip .ico, but do domain-reputation checks for all other hosts.
+        Handle EICAR, then perform domain reputation checks (for non-EICAR URLs).
         """
         url = flow.request.pretty_url.lower()
         logger.info(f"[REQUEST] {url}")
 
-        # 1) If the client is asking for the mitmproxy CA, do NOT do a VT domain‐check.
-        #    Let response() serve it from disk.
-        if flow.request.path == "/mitmproxy-ca-cert.pem":
-            return
-
-        # 2) Skip domain check for .ico (favicons, etc.)
-        parsed = urlparse(url)
-        if parsed.path.lower().endswith(".ico"):
-            return
-
-        # 3) For all other requests, do a VT domain‐reputation check:
-        domain = parsed.netloc.lower()
-        malicious_domain = await is_domain_malicious(domain)
-        if BLOCK_MALICIOUS and malicious_domain:
+        # 1) If the client asked for http://eicar.invalid/eicar.com, serve EICAR locally:
+        if url == "http://eicar.invalid/eicar.com":
             flow.response = http.Response.make(
-                403,
-                b"<h1>403 Forbidden</h1><p>Blocked by VT domain reputation</p>",
-                {"Content-Type": "text/html"},
+                200,
+                EICAR_BYTES,
+                {
+                    "Content-Type": "application/octet-stream",
+                    "Content-Disposition": "attachment; filename=eicar.com",
+                },
             )
             return
 
-        # 4) Otherwise, let the request pass. response() will handle scans if needed.
-        return
-
-    async def response(self, flow: http.HTTPFlow):
-        """
-        Called on every server → proxy → client response.
-        0) If path == /mitmproxy-ca-cert.pem → serve the CA bytes (no VT).
-        1) If 'Content-Disposition: attachment' → VT scan.
-        2) If URL ends with a known risky extension → VT scan.
-        All else (images, CSS, JS, HTML, fonts, etc.) are skipped.
-        """
-        if flow.response is None:
+        # 1b) If ANY URL ends with "/eicar.com", skip VT domain check so we can test file scanning:
+        if url.endswith("/eicar.com"):
+            logger.info("[REQUEST] Skipping domain-reputation check for EICAR payload.")
             return
 
-        # 0) If the client asked for /mitmproxy-ca-cert.pem, return the CA file now
+        # 2) Skip domain check for .ico files (common favicon)
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        if path.endswith(".ico"):
+            return
+
+        # 3) Serve the Mitmproxy CA if requested
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
                 flow.response = http.Response.make(
-                    404,
-                    b"CA not found",
-                    {"Content-Type": "text/plain"}
+                    404, b"CA not found", {"Content-Type": "text/plain"}
                 )
                 return
-
             with open(CA_PATH, "rb") as f:
                 cert_bytes = f.read()
-
             flow.response = http.Response.make(
                 200,
                 cert_bytes,
@@ -253,11 +240,46 @@ class AllInOne:
             )
             return
 
+        # 4) For any other request, perform domain-reputation check
+        domain = parsed.netloc.lower()
+        malicious_domain = await is_domain_malicious(domain)
+        if BLOCK_MALICIOUS and malicious_domain:
+            flow.response = http.Response.make(
+                403,
+                b"<h1>403 Forbidden</h1><p>Blocked by VT domain reputation</p>",
+                {"Content-Type": "text/html"},
+            )
+            return
+
+        # 5) Otherwise, let the request pass through. The response() hook
+        #    will decide if the file needs scanning (based on attachment/extension).
+        return
+
+    async def response(self, flow: http.HTTPFlow):
+        """
+        Called on every server → proxy → client response.
+        Only scan “downloadable” payloads by:
+          (a) checking for Content-Disposition: attachment
+          (b) checking for known “risky” file extensions
+        Everything else (images, CSS, JS, HTML, fonts, etc.) is skipped.
+        """
+        if flow.response is None:
+            return
+
+        # 0) Don’t scan our own mitmproxy CA‐cert fetch:
+        #    If the client is asking for /mitmproxy-ca-cert.pem, just pass it through.
+        if flow.request.path == "/mitmproxy-ca-cert.pem":
+            return
+
         url = flow.request.pretty_url.lower()
         path = urlparse(url).path.lower()
+        ctype = flow.response.headers.get("Content-Type", "").lower()
         cd_header = flow.response.headers.get("Content-Disposition", "").lower()
 
-        # 1) SCAN ANY "attachment" response, regardless of MIME
+        # ──────────────────────────────────────────────────────────────────────────
+        # 1) SCAN ANY “attachment” response, regardless of MIME:
+        #    e.g. server sets: Content-Disposition: attachment; filename="file.pdf"
+        # ──────────────────────────────────────────────────────────────────────────
         if "attachment" in cd_header:
             raw_data = flow.response.raw_content
             logger.info(f"[VT] Scanning “attachment” payload from {url}")
@@ -271,7 +293,7 @@ class AllInOne:
                 )
                 return
 
-            # After file check, optionally do a VT domain check again
+            # Optional: after file check, also do a domain check
             domain = urlparse(url).netloc.lower()
             malicious_domain = await is_domain_malicious(domain)
             if BLOCK_MALICIOUS and malicious_domain:
@@ -282,7 +304,11 @@ class AllInOne:
                 )
             return
 
-        # 2) ONLY scan if the URL's path ends with a known risky extension
+        # ──────────────────────────────────────────────────────────────────────────
+        # 2) ONLY scan if the URL’s path ends with a known “risky” extension:
+        #    .exe, .zip, .pdf, .tar, .gz, .rar, .7z, .msi, .apk, .dmg, .iso,
+        #    .doc, .docx, .xls, .xlsx, .ppt, .pptx, .bat
+        # ──────────────────────────────────────────────────────────────────────────
         scan_exts = (
             ".exe", ".zip", ".pdf", ".tar", ".gz", ".rar",
             ".7z", ".msi", ".apk", ".dmg", ".iso", ".doc",
@@ -301,7 +327,7 @@ class AllInOne:
                 )
                 return
 
-            # After file check, optionally do a VT domain check again
+            # Optional: after file check, also check domain
             domain = urlparse(url).netloc.lower()
             malicious_domain = await is_domain_malicious(domain)
             if BLOCK_MALICIOUS and malicious_domain:
@@ -312,7 +338,9 @@ class AllInOne:
                 )
             return
 
-        # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped
+        # ──────────────────────────────────────────────────────────────────────────
+        # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped:
+        # ──────────────────────────────────────────────────────────────────────────
         return
 
 
