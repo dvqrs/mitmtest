@@ -7,6 +7,7 @@ import time
 import requests
 import ipaddress
 import re
+import hashlib
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -112,75 +113,114 @@ async def is_domain_malicious(domain: str) -> bool:
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    Submit binary to VT's file‐scan endpoint, poll until analysis,
-    return True if VT flags it malicious. Uses SHA256 cache.
+    1) Compute SHA256 of content_bytes.
+    2) If cached and not expired, return cached value.
+    3) Try GET /api/v3/files/{sha256}.
+       • If VT knows it, read last_analysis_stats.malicious.
+       • Otherwise, do POST /api/v3/files & poll /api/v3/analyses/{id}.
+    4) Cache result and return.
     """
-    import hashlib
-
     sha256 = hashlib.sha256(content_bytes).hexdigest()
     now = time.time()
+
+    # Log the hash for debugging
+    logger.info(f"[DEBUG] Computed SHA256: {sha256}")
+
+    # 1) Check local cache
     if sha256 in _file_cache:
         age = now - _file_cache_timestamps.get(sha256, 0)
         if age < FILE_CACHE_TTL:
+            logger.info(f"[VT] Cache hit for {sha256[:10]}… → malicious={_file_cache[sha256]}")
             return _file_cache[sha256]
 
+    # 2) Acquire semaphore so we don’t exceed your VT_API_KEYS rate
     async with file_scan_semaphore:
         api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
-        files = {"file": ("file", content_bytes)}
 
-        logger.info(f"[VT] → Uploading file to VT (sha256={sha256[:10]}…, key …{api_key[-6:]})")
+        # 3a) First try: query VT’s /files/{sha256} endpoint
+        file_info_url = f"https://www.virustotal.com/api/v3/files/{sha256}"
         try:
-            upload_resp = await asyncio.get_event_loop().run_in_executor(
+            resp = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: requests.post(
-                    "https://www.virustotal.com/api/v3/files",
-                    headers=headers,
-                    files=files,
-                    timeout=30
-                )
+                lambda: requests.get(file_info_url, headers=headers, timeout=10)
             )
-            upload_resp.raise_for_status()
-            analysis_id = upload_resp.json()["data"]["id"]
-            logger.info(f"[VT] ← Upload succeeded, analysis_id={analysis_id}")
-        except Exception as e:
-            logger.warning(f"[VT] file upload error: {e}")
-            _file_cache[sha256] = False
-            _file_cache_timestamps[sha256] = now
-            return False
-
-    vt_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
-    while True:
-        try:
-            logger.info(f"[VT] Polling for {analysis_id} …")
-            await asyncio.sleep(2)
-
-            headers = {"x-apikey": api_key}
-            r = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: requests.get(vt_url, headers=headers, timeout=10)
-            )
-            r.raise_for_status()
-            j = r.json()
-            status = j.get("data", {}).get("attributes", {}).get("status")
-            if status == "queued":
-                continue
-            if status == "completed":
-                stats = j.get("data", {}).get("attributes", {}).get("stats", {})
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                stats = data.get("attributes", {}).get("last_analysis_stats", {})
                 malicious = stats.get("malicious", 0) > 0
-                logger.info(f"[VT] File {analysis_id} analysis done → malicious={malicious}")
+
                 _file_cache[sha256] = malicious
                 _file_cache_timestamps[sha256] = now
+
+                logger.info(f"[VT] Existing hash lookup: {sha256[:10]}… → malicious={malicious}")
                 return malicious
-            else:
-                logger.warning(f"[VT] Unexpected file analysis status '{status}' for {analysis_id}")
+
+            if resp.status_code != 404:
+                # Some other error (rate limit? 403?), just log and treat as “not malicious”
+                logger.warning(f"[VT] Unexpected status {resp.status_code} querying {file_info_url}")
                 _file_cache[sha256] = False
                 _file_cache_timestamps[sha256] = now
                 return False
+
         except Exception as e:
-            logger.warning(f"[VT] error polling file analysis: {e}")
+            logger.warning(f"[VT] Error querying file endpoint: {e}")
             _file_cache[sha256] = False
             _file_cache_timestamps[sha256] = now
             return False
+
+        # 3b) If VT never saw the file (404), upload it
+        files = {"file": ("file", content_bytes)}
+        upload_url = "https://www.virustotal.com/api/v3/files"
+        try:
+            logger.info(f"[VT] → Uploading file to VT (sha256={sha256[:10]}…, key …{api_key[-6:]})")
+            upload_resp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: requests.post(upload_url, headers=headers, files=files, timeout=30)
+            )
+            upload_resp.raise_for_status()
+            analysis_id = upload_resp.json()["data"]["id"]
+            logger.info(f"[VT] Upload succeeded, analysis_id={analysis_id}")
+        except Exception as e:
+            logger.warning(f"[VT] File upload error: {e}")
+            _file_cache[sha256] = False
+            _file_cache_timestamps[sha256] = now
+            return False
+
+        # 4) Poll the analysis endpoint until “completed”
+        analysis_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+        while True:
+            try:
+                await asyncio.sleep(2)
+                resp2 = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: requests.get(analysis_url, headers=headers, timeout=10)
+                )
+                resp2.raise_for_status()
+                j = resp2.json()
+                status = j.get("data", {}).get("attributes", {}).get("status")
+                if status == "queued":
+                    continue
+                if status == "completed":
+                    stats = j.get("data", {}).get("attributes", {}).get("stats", {})
+                    malicious = stats.get("malicious", 0) > 0
+                    logger.info(f"[VT] Analysis done (id={analysis_id}) → malicious={malicious}")
+
+                    _file_cache[sha256] = malicious
+                    _file_cache_timestamps[sha256] = now
+                    return malicious
+
+                # Unexpected status (e.g., “timeout”)
+                logger.warning(f"[VT] Unexpected analysis status '{status}' for {analysis_id}")
+                _file_cache[sha256] = False
+                _file_cache_timestamps[sha256] = now
+                return False
+
+            except Exception as e:
+                logger.warning(f"[VT] Error polling file analysis: {e}")
+                _file_cache[sha256] = False
+                _file_cache_timestamps[sha256] = now
+                return False
 
 
 class AllInOne:
@@ -224,15 +264,14 @@ class AllInOne:
             )
             return
 
-
     async def response(self, flow: http.HTTPFlow):
         """
         Called on every server → proxy → client response.
         Enhanced with:
           - Small response skipping
-          - File download pattern detection
+          - File download pattern detection (including .com)
           - Extended binary detection
-          - Skip CA certificate scanning
+          - File‐scan with VT “query‐then‐upload”
         """
         if flow.response is None:
             return
@@ -253,35 +292,39 @@ class AllInOne:
         query = parsed.query.lower()
         content_disp = flow.response.headers.get("Content-Disposition", "").lower()
 
-        # 1. File download patterns
+        # 1. File download patterns (now including .com)
         is_download = any([
             "attachment" in content_disp,
             "download" in query,
-            re.search(r'\.(exe|dll|zip|rar|pdf|docx?|xlsx?|pptx?|jar)$', path),
+            re.search(r'\.(exe|dll|zip|rar|pdf|docx?|xlsx?|pptx?|jar|com)$', path),
             "mms-type" in query
         ])
 
         # 2. Extended binary detection
         ctype = flow.response.headers.get("Content-Type", "").lower()
         is_binary = any(term in ctype for term in [
-            "octet-stream", "pdf", "zip", "x-msdownload", 
-            "vnd.microsoft.portable-executable", "video", "image"
+            "octet-stream", "pdf", "zip",
+            "x-msdownload", "vnd.microsoft.portable-executable",
+            "video", "image"
         ])
 
-        # 3. Process suspicious responses
+        # 3. If it looks like a file, compute SHA256, log it, and scan it
         if is_download or is_binary:
-            logger.info(f"Scanning file: {url} | Type: {ctype}")
+            # Compute and log the SHA256 for debugging
+            sha256 = hashlib.sha256(flow.response.raw_content).hexdigest()
+            logger.info(f"[SCAN] Scanning file: {url} | SHA256={sha256} | Content-Type={ctype} | Download:{is_download}")
+
             try:
                 malicious = await is_file_malicious(flow.response.raw_content)
                 if malicious:
-                    logger.warning(f"Blocking malicious file: {url}")
+                    logger.warning(f"[BLOCK] Malicious file blocked: {url} (SHA256={sha256})")
                     flow.response = http.Response.make(
                         403,
                         b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
                         {"Content-Type": "text/html"},
                     )
             except Exception as e:
-                logger.error(f"File scan failed: {str(e)}")
+                logger.error(f"[ERROR] File scan failed for {url}: {e}")
 
 
 async def run_proxy():
