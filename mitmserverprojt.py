@@ -49,6 +49,10 @@ FILE_CACHE_TTL = 3600  # 1 hour
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
 
+# Size thresholds for download scanning (in bytes)
+MIN_SCAN_SIZE = 10 * 1024           # 10 KB
+MAX_SCAN_SIZE = 100 * 1024 * 1024   # 100 MB
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
@@ -224,12 +228,15 @@ class AllInOne:
             )
             return
 
-
     async def response(self, flow: http.HTTPFlow):
         """
         Called on every server → proxy → client response.
-        Only run VT file scans on “real” binaries (e.g. PDF, EXE, ZIP).
-        Skip all images, fonts, CSS, JavaScript, and other non‐binary types.
+
+        1) Skip CSS, JS, fonts, images (static assets).
+        2) Detect any download by looking for Content-Disposition: attachment.
+        3) Apply size thresholds to skip very small or very large files.
+        4) Check Content-Type against an expanded “binary_types” list.
+        5) Only VT-scan the remaining payloads.
         """
         if flow.response is None:
             return
@@ -239,22 +246,42 @@ class AllInOne:
 
         path = urlparse(url).path.lower()
 
-        # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .jpeg, .gif
-        skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif")
+        # ── 1) Skip “inline” static assets ──────────────────────────────────────
+        # We skip .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .jpeg, .gif,
+        # .css, and .js because those are almost always inline resources,
+        # not user downloads.
+        skip_exts = (
+            ".ico", ".svg", ".woff", ".woff2", ".ttf",
+            ".png", ".jpg", ".jpeg", ".gif", ".css", ".js"
+        )
         if path.endswith(skip_exts):
+            # For .css/.js, log that we allow them through
+            if path.endswith((".css", ".js")):
+                logger.info(f"[INLINE] Allowing static asset: {path}")
             return
 
-        # LOOSENED CSS heuristics: allow .css
-        if path.endswith(".css"):
-            logger.info(f"[CSS] Allowing CSS asset through: {path}")
+        # ── 2) Detect “download” via Content-Disposition: attachment ────────────
+        cd_header = flow.response.headers.get("Content-Disposition", "")
+        is_attachment = "attachment" in cd_header.lower()
+
+        if not is_attachment:
+            # If there's no "attachment" header, we treat it as inline again.
             return
 
-        # LOOSENED JS heuristics: allow .js
-        if path.endswith(".js"):
-            logger.info(f"[JS] Allowing JS asset through: {path}")
+        # ── 3) At this point, it's a “download” candidate ─────────────────────
+        raw_data = flow.response.raw_content
+        size_bytes = len(raw_data)
+        logger.info(f"[DOWNLOAD] Detected download: size={size_bytes} bytes")
+
+        # ── 4) Size thresholds: skip if too small or too large ─────────────────
+        if size_bytes < MIN_SCAN_SIZE:
+            logger.info(f"[SKIP] Download under {MIN_SCAN_SIZE // 1024} KB → not scanning")
+            return
+        if size_bytes > MAX_SCAN_SIZE:
+            logger.info(f"[SKIP] Download over {MAX_SCAN_SIZE // (1024 * 1024)} MB → not scanning")
             return
 
-        # For everything else, check Content‐Type header
+        # ── 5) Check Content-Type against expanded “binary_types” ───────────────
         ctype = flow.response.headers.get("Content-Type", "").lower()
         binary_types = [
             "application/octet-stream",
@@ -262,26 +289,38 @@ class AllInOne:
             "application/zip",
             "application/x-msdownload",
             "application/vnd.microsoft.portable-executable",
+            # Expanded types for Office documents, APKs, etc.
+            "application/msword",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
+            "application/vnd.ms-excel",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+            "application/vnd.ms-powerpoint",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+            "application/vnd.android.package-archive",  # APK
         ]
-        if any(bt in ctype for bt in binary_types):
-            raw_data = flow.response.raw_content
-            try:
-                logger.info(f"[VT] Scanning binary payload from {url} (Content-Type={ctype})")
-                malicious_file = await is_file_malicious(raw_data)
-            except Exception as e:
-                logger.warning(f"[RESPONSE] file scanning error: {e}")
-                malicious_file = False
+        is_likely_binary = any(bt in ctype for bt in binary_types)
 
-            if BLOCK_MALICIOUS and malicious_file:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
-                    {"Content-Type": "text/html"},
-                )
-                return
+        if not is_likely_binary:
+            logger.info(f"[SKIP] Not a binary type (Content-Type={ctype}) → not scanning")
+            return
 
-        # HTML pages: you could scan inline scripts or references, but skip for brevity
-        # Everything else passes through
+        # ── 6) VT‐scan the remaining payloads ───────────────────────────────────
+        try:
+            logger.info(f"[VT] Scanning download from {url} (Content-Type={ctype})")
+            malicious_file = await is_file_malicious(raw_data)
+        except Exception as e:
+            logger.warning(f"[RESPONSE] file scanning error: {e}")
+            malicious_file = False
+
+        if BLOCK_MALICIOUS and malicious_file:
+            flow.response = http.Response.make(
+                403,
+                b"<h1>403 Forbidden</h1><p>Blocked malicious download</p>",
+                {"Content-Type": "text/html"},
+            )
+            return
+
+        # If not malicious, allow it through unchanged.
 
 
 async def run_proxy():
