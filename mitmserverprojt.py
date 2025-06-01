@@ -20,12 +20,6 @@ from mitmproxy.tools.dump import DumpMaster
 
 MITM_PORT = 8443
 
-# Path to mitmproxy's CA cert
-CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
-
-# EICAR test file bytes
-EICAR_BYTES = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-
 # VirusTotal API keys (rotate through them)
 VT_API_KEYS = [
     "0d47d2a03a43518344efd52726514f3b9dacc3e190742ee52eae89e6494dc416",
@@ -193,26 +187,13 @@ class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        Handle EICAR, then perform domain reputation checks (for non-EICAR URLs).
+        Perform domain reputation checks (skipping CA cert fetch).
         """
         url = flow.request.pretty_url.lower()
         logger.info(f"[REQUEST] {url}")
 
-        # 1) If the client asked for http://eicar.invalid/eicar.com, serve EICAR locally:
-        if url == "http://eicar.invalid/eicar.com":
-            flow.response = http.Response.make(
-                200,
-                EICAR_BYTES,
-                {
-                    "Content-Type": "application/octet-stream",
-                    "Content-Disposition": "attachment; filename=eicar.com",
-                },
-            )
-            return
-
-        # 1b) If ANY URL ends with "/eicar.com", skip VT domain check so we can test file scanning:
-        if url.endswith("/eicar.com"):
-            logger.info("[REQUEST] Skipping domain-reputation check for EICAR payload.")
+        # 1) Skip domain check for fetching mitmproxy's CA certificate
+        if flow.request.path == "/mitmproxy-ca-cert.pem":
             return
 
         # 2) Skip domain check for .ico files (common favicon)
@@ -221,26 +202,7 @@ class AllInOne:
         if path.endswith(".ico"):
             return
 
-        # 3) Serve the Mitmproxy CA if requested
-        if flow.request.path == "/mitmproxy-ca-cert.pem":
-            if not os.path.isfile(CA_PATH):
-                flow.response = http.Response.make(
-                    404, b"CA not found", {"Content-Type": "text/plain"}
-                )
-                return
-            with open(CA_PATH, "rb") as f:
-                cert_bytes = f.read()
-            flow.response = http.Response.make(
-                200,
-                cert_bytes,
-                {
-                    "Content-Type": "application/x-pem-file",
-                    "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem",
-                },
-            )
-            return
-
-        # 4) For any other request, perform domain-reputation check
+        # 3) For any other request, perform domain-reputation check
         domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
@@ -251,7 +213,7 @@ class AllInOne:
             )
             return
 
-        # 5) Otherwise, let the request pass through. The response() hook
+        # 4) Otherwise, let the request pass through. The response() hook
         #    will decide if the file needs scanning (based on attachment/extension).
         return
 
@@ -264,6 +226,13 @@ class AllInOne:
         Everything else (images, CSS, JS, HTML, fonts, etc.) is skipped.
         """
         if flow.response is None:
+            return
+
+        # ──────────────────────────────────────────────────────────────────────────
+        # 0) Don’t scan our own mitmproxy CA‐cert fetch:
+        #    If the client is asking for /mitmproxy-ca-cert.pem, just pass it through.
+        # ──────────────────────────────────────────────────────────────────────────
+        if flow.request.path == "/mitmproxy-ca-cert.pem":
             return
 
         url = flow.request.pretty_url.lower()
@@ -335,7 +304,6 @@ class AllInOne:
 
         # ──────────────────────────────────────────────────────────────────────────
         # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped:
-        #    (No file scan, no domain‐reputation recheck here.)
         # ──────────────────────────────────────────────────────────────────────────
         return
 
