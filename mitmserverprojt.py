@@ -7,6 +7,8 @@ import time
 import requests
 import ipaddress
 import re
+import json
+import base64
 from urllib.parse import urlparse
 import hashlib
 
@@ -118,15 +120,51 @@ async def is_domain_malicious(domain: str) -> bool:
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
     Try a VT “report by hash” lookup first. If that fails, upload & poll.
-    Returns True if VT flags it malicious.
+    Returns True if VT (or our EICAR quick‐check) flags it malicious.
     """
-    # 1) Quick EICAR signature check: if payload contains the known EICAR marker, block immediately.
-    if EICAR_MAGIC in content_bytes:
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1) Wrapper‐detection: try to peel off any JSON/Base64 envelope WhatsApp might add
+    # ──────────────────────────────────────────────────────────────────────────
+    raw = content_bytes
+
+    # If it looks like UTF-8 JSON, try parsing:
+    decoded_text = None
+    try:
+        # We do a quick “looks like JSON” test: does it start with “{” or “[”?
+        if raw.lstrip().startswith(b"{") or raw.lstrip().startswith(b"["):
+            decoded_text = raw.decode('utf-8', errors='strict')
+            obj = json.loads(decoded_text)  # if JSON parsing succeeds, proceed
+            # If there’s a key named “data” that starts with “data:…;base64,”
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(v, str) and v.lower().startswith("data:") and "base64," in v:
+                        # Extract everything after the first “base64,”
+                        b64_part = v.split("base64,")[1]
+                        try:
+                            raw = base64.b64decode(b64_part)
+                            logger.info("[VT] Unwrapped JSON→Base64 payload → using decoded bytes")
+                        except Exception:
+                            # If base64 decode fails, just keep raw as-is
+                            pass
+                        break
+    except Exception:
+        # If JSON parsing fails, just keep raw = content_bytes
+        raw = content_bytes
+
+    # Now `raw` is either the decoded‐Base64 payload (if it was JSON/Base64),
+    # or the original `content_bytes`.
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2) Quick EICAR signature check: if payload contains the known EICAR marker, block immediately
+    # ──────────────────────────────────────────────────────────────────────────
+    if EICAR_MAGIC in raw:
         logger.warning("[VT] EICAR signature found in payload → blocking immediately")
         return True
 
-    # 2) Normalize by stripping leading/trailing whitespace (e.g., newlines) so we can match the canonical SHA-256
-    normalized = content_bytes.strip()
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3) Normalize by stripping whitespace so we can match the canonical SHA-256
+    # ──────────────────────────────────────────────────────────────────────────
+    normalized = raw.strip()
     sha256 = hashlib.sha256(normalized).hexdigest()
     now = time.time()
     if sha256 in _file_cache:
@@ -138,7 +176,9 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
         api_key = get_vt_api_key()
         headers = {"x-apikey": api_key}
 
-        # 3) VT “report lookup” by hash
+        # ──────────────────────────────────────────────────────────────────────
+        # 4) VT "report lookup" (GET /api/v3/files/{sha256})
+        # ──────────────────────────────────────────────────────────────────────
         report_url = f"https://www.virustotal.com/api/v3/files/{sha256}"
         try:
             report_resp = await asyncio.get_event_loop().run_in_executor(
@@ -155,21 +195,25 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
                 return malicious
             elif report_resp.status_code != 404:
                 logger.warning(
-                    f"[VT] Unexpected status {report_resp.status_code} for report lookup"
+                    f"[VT] Unexpected status {report_resp.status_code} for report lookup. Falling back to upload."
                 )
-                # Fall through to upload if not 404
+                # If it’s 4xx/5xx (not 404), fall through to upload
         except Exception as e:
             logger.warning(f"[VT] Report lookup error: {e}")
             # Fall through to upload
 
-        # 4) If the hash matches the known EICAR SHA-256 exactly, we know VT flags it as malicious
+        # ──────────────────────────────────────────────────────────────────────
+        # 5) If it’s exactly the canonical EICAR SHA-256, we already know VT flags it malicious
+        # ──────────────────────────────────────────────────────────────────────
         if sha256 == EICAR_SHA256:
             logger.info(f"[VT] Canonical EICAR hash {sha256[:10]}… → blocking")
             _file_cache[sha256] = True
             _file_cache_timestamps[sha256] = now
             return True
 
-        # 5) Otherwise, upload to VT and poll as before, using normalized bytes
+        # ──────────────────────────────────────────────────────────────────────
+        # 6) Otherwise, re‐upload to VT for scanning (fallback to existing logic)
+        # ──────────────────────────────────────────────────────────────────────
         files = {"file": ("file", normalized)}
         logger.info(f"[VT] → Uploading file to VT (sha256={sha256[:10]}…, key …{api_key[-6:]})")
         try:
@@ -191,7 +235,9 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             _file_cache_timestamps[sha256] = now
             return False
 
-    # 6) Poll for analysis result
+    # ──────────────────────────────────────────────────────────────────────────
+    # 7) Poll for analysis result
+    # ──────────────────────────────────────────────────────────────────────────
     vt_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
     while True:
         try:
