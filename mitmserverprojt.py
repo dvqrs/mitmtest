@@ -7,7 +7,6 @@ import signal
 import time
 import requests
 import ipaddress
-import re
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -19,6 +18,9 @@ from mitmproxy.tools.dump import DumpMaster
 # ──────────────────────────────────────────────────────────────────────────────
 
 MITM_PORT = 8443
+
+# Path to mitmproxy's CA cert (the file mitmproxy itself generated)
+CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
 # VirusTotal API keys (rotate through them)
 VT_API_KEYS = [
@@ -52,13 +54,13 @@ logger = logging.getLogger("mitmproxy")
 
 
 def get_vt_api_key() -> str:
-    """Round-robin selection of a VT API key."""
+    """Round‐robin selection of a VT API key."""
     return next(_key_cycle)
 
 
 def is_private_or_localhost(hostname: str) -> bool:
     """
-    Return True if `hostname` is 'localhost' or a private-network IP.
+    Return True if `hostname` is 'localhost' or a private‐network IP.
     Used to skip VT lookups on those.
     """
     hn = hostname.lower().split(":", 1)[0]
@@ -110,7 +112,7 @@ async def is_domain_malicious(domain: str) -> bool:
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    Submit binary to VT's file-scan endpoint, poll until analysis,
+    Submit binary to VT's file‐scan endpoint, poll until analysis,
     return True if VT flags it malicious. Uses SHA256 cache.
     """
     import hashlib
@@ -187,7 +189,8 @@ class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        Perform domain reputation checks (skipping CA cert fetch).
+        We skip domain checks for CA‐cert path and .ico files.
+        Everything else proceeds to domain‐reputation check.
         """
         url = flow.request.pretty_url.lower()
         logger.info(f"[REQUEST] {url}")
@@ -198,11 +201,10 @@ class AllInOne:
 
         # 2) Skip domain check for .ico files (common favicon)
         parsed = urlparse(url)
-        path = parsed.path.lower()
-        if path.endswith(".ico"):
+        if parsed.path.lower().endswith(".ico"):
             return
 
-        # 3) For any other request, perform domain-reputation check
+        # 3) For any other request, perform domain‐reputation check
         domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
@@ -213,37 +215,48 @@ class AllInOne:
             )
             return
 
-        # 4) Otherwise, let the request pass through. The response() hook
-        #    will decide if the file needs scanning (based on attachment/extension).
+        # 4) Otherwise, let the request go through. response() will handle scans.
         return
 
     async def response(self, flow: http.HTTPFlow):
         """
         Called on every server → proxy → client response.
-        Only scan “downloadable” payloads by:
-          (a) checking for Content-Disposition: attachment
-          (b) checking for known “risky” file extensions
-        Everything else (images, CSS, JS, HTML, fonts, etc.) is skipped.
+        0) If path is /mitmproxy-ca-cert.pem → serve the CA (no VT checks).
+        1) If “Content‐Disposition: attachment” → VT scan.
+        2) If URL ends with a known “risky” extension → VT scan.
+        All other responses are skipped (images, CSS, JS, HTML, fonts, etc.).
         """
         if flow.response is None:
             return
 
-        # ──────────────────────────────────────────────────────────────────────────
-        # 0) Don’t scan our own mitmproxy CA‐cert fetch:
-        #    If the client is asking for /mitmproxy-ca-cert.pem, just pass it through.
-        # ──────────────────────────────────────────────────────────────────────────
+        # 0) Don’t scan or VT‐check our own mitmproxy CA‐cert fetch; just serve it
         if flow.request.path == "/mitmproxy-ca-cert.pem":
+            if not os.path.isfile(CA_PATH):
+                flow.response = http.Response.make(
+                    404,
+                    b"CA not found",
+                    {"Content-Type": "text/plain"}
+                )
+                return
+
+            # Read and return the CA certificate
+            with open(CA_PATH, "rb") as f:
+                cert_bytes = f.read()
+            flow.response = http.Response.make(
+                200,
+                cert_bytes,
+                {
+                    "Content-Type": "application/x-pem-file",
+                    "Content-Disposition": "attachment; filename=mitmproxy-ca-cert.pem",
+                },
+            )
             return
 
         url = flow.request.pretty_url.lower()
         path = urlparse(url).path.lower()
-        ctype = flow.response.headers.get("Content-Type", "").lower()
         cd_header = flow.response.headers.get("Content-Disposition", "").lower()
 
-        # ──────────────────────────────────────────────────────────────────────────
         # 1) SCAN ANY “attachment” response, regardless of MIME:
-        #    e.g. server sets: Content-Disposition: attachment; filename="file.pdf"
-        # ──────────────────────────────────────────────────────────────────────────
         if "attachment" in cd_header:
             raw_data = flow.response.raw_content
             logger.info(f"[VT] Scanning “attachment” payload from {url}")
@@ -268,11 +281,7 @@ class AllInOne:
                 )
             return
 
-        # ──────────────────────────────────────────────────────────────────────────
         # 2) ONLY scan if the URL’s path ends with a known “risky” extension:
-        #    .exe, .zip, .pdf, .tar, .gz, .rar, .7z, .msi, .apk, .dmg, .iso,
-        #    .doc, .docx, .xls, .xlsx, .ppt, .pptx, .bat
-        # ──────────────────────────────────────────────────────────────────────────
         scan_exts = (
             ".exe", ".zip", ".pdf", ".tar", ".gz", ".rar",
             ".7z", ".msi", ".apk", ".dmg", ".iso", ".doc",
@@ -291,7 +300,7 @@ class AllInOne:
                 )
                 return
 
-            # Optional: after file check, also check domain
+            # Optional: after file check, also do a domain check
             domain = urlparse(url).netloc.lower()
             malicious_domain = await is_domain_malicious(domain)
             if BLOCK_MALICIOUS and malicious_domain:
@@ -302,9 +311,7 @@ class AllInOne:
                 )
             return
 
-        # ──────────────────────────────────────────────────────────────────────────
         # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped:
-        # ──────────────────────────────────────────────────────────────────────────
         return
 
 
