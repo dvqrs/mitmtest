@@ -10,7 +10,7 @@ import ipaddress
 import re
 from urllib.parse import urlparse
 
-from mitmproxy import http
+from mitmproxy import http, websocket
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
@@ -304,56 +304,4 @@ class AllInOne:
                 )
             return
 
-        # ──────────────────────────────────────────────────────────────────────────
-        # 2) ONLY scan if the URL’s path ends with a known “risky” extension:
-        #    .exe, .zip, .pdf, .tar, .gz, .rar, .7z, .msi, .apk, .dmg, .iso,
-        #    .doc, .docx, .xls, .xlsx, .ppt, .pptx, .bat
-        # ──────────────────────────────────────────────────────────────────────────
-        scan_exts = (
-            ".exe", ".zip", ".pdf", ".tar", ".gz", ".rar",
-            ".7z", ".msi", ".apk", ".dmg", ".iso", ".doc",
-            ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".bat"
-        )
-        if any(path.endswith(ext) for ext in scan_exts):
-            raw_data = flow.response.raw_content
-            logger.info(f"[VT] Scanning “downloadable” payload from {url}")
-            malicious_file = await is_file_malicious(raw_data)
-
-            if BLOCK_MALICIOUS and malicious_file:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
-                    {"Content-Type": "text/html"},
-                )
-                return
-
-            # Optional: after file check, also check domain
-            domain = urlparse(url).netloc.lower()
-            malicious_domain = await is_domain_malicious(domain)
-            if BLOCK_MALICIOUS and malicious_domain:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked by VT domain reputation</p>",
-                    {"Content-Type": "text/html"},
-                )
-            return
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped:
-        # ──────────────────────────────────────────────────────────────────────────
-        return
-
-
-async def run_proxy():
-    loop = asyncio.get_running_loop()
-    opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
-    m = DumpMaster(opts)
-    m.addons.add(AllInOne())
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
-    logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
-    await m.run()
-
-
-if __name__ == "__main__":
-    asyncio.run(run_proxy())
+        # ─────────────────────────────────────────────
