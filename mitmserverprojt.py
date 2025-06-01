@@ -10,7 +10,7 @@ import ipaddress
 import re
 from urllib.parse import urlparse
 
-from mitmproxy import http, websocket
+from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
@@ -23,7 +23,7 @@ MITM_PORT = 8443
 # Path to mitmproxy's CA cert
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
-# EICAR test file bytes (for the built-in eicar.invalid URL)
+# EICAR test file bytes
 EICAR_BYTES = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
 # VirusTotal API keys (rotate through them)
@@ -53,22 +53,18 @@ FILE_CACHE_TTL = 3600  # 1 hour
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
 
-# Minimum WS message size (bytes) to treat as a “downloadable” blob
-WS_BINARY_MIN_SIZE = 10 * 1024  # 10 KiB
-
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
 
 
 def get_vt_api_key() -> str:
-    """Round‐robin selection of a VT API key."""
+    """Round-robin selection of a VT API key."""
     return next(_key_cycle)
 
 
 def is_private_or_localhost(hostname: str) -> bool:
     """
-    Return True if `hostname` is 'localhost' or a private‐network IP.
+    Return True if `hostname` is 'localhost' or a private-network IP.
     Used to skip VT lookups on those.
     """
     hn = hostname.lower().split(":", 1)[0]
@@ -120,14 +116,13 @@ async def is_domain_malicious(domain: str) -> bool:
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    Submit binary to VT's file‐scan endpoint, poll until analysis,
+    Submit binary to VT's file-scan endpoint, poll until analysis,
     return True if VT flags it malicious. Uses SHA256 cache.
     """
     import hashlib
 
     sha256 = hashlib.sha256(content_bytes).hexdigest()
     now = time.time()
-    # Return cached result if within TTL
     if sha256 in _file_cache:
         age = now - _file_cache_timestamps.get(sha256, 0)
         if age < FILE_CACHE_TTL:
@@ -138,6 +133,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
         headers = {"x-apikey": api_key}
         files = {"file": ("file", content_bytes)}
 
+        # *** ADDITION: Log right before the upload to VT. ***
         logger.info(f"[VT] → Uploading file to VT (sha256={sha256[:10]}…, key …{api_key[-6:]})")
         try:
             upload_resp = await asyncio.get_event_loop().run_in_executor(
@@ -162,6 +158,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
     while True:
         try:
             logger.info(f"[VT] Polling for {analysis_id} …")
+            # Sleep briefly before polling
             await asyncio.sleep(2)
 
             headers = {"x-apikey": api_key}
@@ -172,6 +169,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             j = r.json()
             status = j.get("data", {}).get("attributes", {}).get("status")
             if status == "queued":
+                # Still in VT queue; keep waiting
                 continue
             if status == "completed":
                 stats = j.get("data", {}).get("attributes", {}).get("stats", {})
@@ -181,7 +179,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
                 _file_cache_timestamps[sha256] = now
                 return malicious
             else:
-                logger.warning(f"[VT] Unexpected file analysis status “{status}” for {analysis_id}")
+                logger.warning(f"[VT] Unexpected file analysis status '{status}' for {analysis_id}")
                 _file_cache[sha256] = False
                 _file_cache_timestamps[sha256] = now
                 return False
@@ -196,13 +194,13 @@ class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
         Called on every client → proxy → server request.
-        Handle EICAR, then perform domain reputation checks (for non‐EICAR URLs).
+        Handle EICAR, then perform domain reputation checks.
         """
-        url = flow.request.pretty_url.lower()
+        url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # 1) If the client asked for http://eicar.invalid/eicar.com, serve EICAR locally:
-        if url == "http://eicar.invalid/eicar.com":
+        # 1) If the client asked for http://eicar.invalid/eicar.com, serve EICAR
+        if url.lower() == "http://eicar.invalid/eicar.com":
             flow.response = http.Response.make(
                 200,
                 EICAR_BYTES,
@@ -213,12 +211,7 @@ class AllInOne:
             )
             return
 
-        # 1b) If ANY URL ends with "/eicar.com", skip VT domain check so we can test file scanning:
-        if url.endswith("/eicar.com"):
-            logger.info("[REQUEST] Skipping domain‐reputation check for EICAR payload.")
-            return
-
-        # 2) Skip domain check for .ico files (common favicon)
+        # 2) Skip domain check for .ico files
         parsed = urlparse(url)
         path = parsed.path.lower()
         if path.endswith(".ico"):
@@ -243,7 +236,7 @@ class AllInOne:
             )
             return
 
-        # 4) For any other request, perform domain‐reputation check
+        # 4) Domain reputation check (async)
         domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
@@ -254,39 +247,55 @@ class AllInOne:
             )
             return
 
-        # 5) Otherwise, let the request pass through. The response() and websocket_message()
-        #    hooks will decide if the payload needs scanning.
-        return
+        # 5) (Optional) Inspect POST payloads for SQLi etc.
 
     async def response(self, flow: http.HTTPFlow):
         """
         Called on every server → proxy → client response.
-        Only scan “downloadable” payloads by:
-          (a) checking for Content-Disposition: attachment
-          (b) checking for known “risky” file extensions
-        Everything else (images, CSS, JS, HTML, fonts, etc.) is skipped.
+        Check CSS, JS, and binaries.
         """
         if flow.response is None:
             return
 
-        # 0) Don’t scan our own mitmproxy CA‐cert fetch:
-        #    If the client is asking for /mitmproxy-ca-cert.pem, just pass it through.
-        if flow.request.path == "/mitmproxy-ca-cert.pem":
-            return
+        url = flow.request.pretty_url
+        logger.info(f"[RESPONSE] {url}")
 
-        url = flow.request.pretty_url.lower()
         path = urlparse(url).path.lower()
+
+        # Skip tiny static assets: .ico, .svg, .woff, .woff2, .ttf, .png, .jpg, .gif
+        skip_exts = (".ico", ".svg", ".woff", ".woff2", ".ttf", ".png", ".jpg", ".jpeg", ".gif")
+        if path.endswith(skip_exts):
+            return
+
+        # --- LOOSENED CSS heuristics: no automatic 403 for size/expressions/data:URL ---
+        if path.endswith(".css"):
+            # Just log the fact that we saw a CSS file; do not block by default
+            logger.info(f"[CSS] Allowing CSS asset through: {path}")
+            return
+
+        # --- LOOSENED JS heuristics: no automatic 403 for URLs/size/eval(atob) ---
+        if path.endswith(".js"):
+            logger.info(f"[JS] Allowing JS asset through: {path}")
+            return
+
+        # Binary files: PDF, ZIP, EXE, etc. → full VT file scan
         ctype = flow.response.headers.get("Content-Type", "").lower()
-        cd_header = flow.response.headers.get("Content-Disposition", "").lower()
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # 1) SCAN ANY “attachment” response, regardless of MIME:
-        #    e.g. server sets: Content-Disposition: attachment; filename="file.pdf"
-        # ──────────────────────────────────────────────────────────────────────────
-        if "attachment" in cd_header:
+        binary_types = [
+            "application/octet-stream",
+            "application/pdf",
+            "application/zip",
+            "application/x-msdownload",
+            "application/vnd.microsoft.portable-executable",
+        ]
+        if any(bt in ctype for bt in binary_types):
             raw_data = flow.response.raw_content
-            logger.info(f"[VT] Scanning “attachment” payload from {url}")
-            malicious_file = await is_file_malicious(raw_data)
+            try:
+                # Log that we’re about to scan this file
+                logger.info(f"[VT] Scanning binary payload from {url} (Content-Type={ctype})")
+                malicious_file = await is_file_malicious(raw_data)
+            except Exception as e:
+                logger.warning(f"[RESPONSE] file scanning error: {e}")
+                malicious_file = False
 
             if BLOCK_MALICIOUS and malicious_file:
                 flow.response = http.Response.make(
@@ -296,85 +305,8 @@ class AllInOne:
                 )
                 return
 
-            # Optional: after file check, also do a domain check
-            domain = urlparse(url).netloc.lower()
-            malicious_domain = await is_domain_malicious(domain)
-            if BLOCK_MALICIOUS and malicious_domain:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked by VT domain reputation</p>",
-                    {"Content-Type": "text/html"},
-                )
-            return
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # 2) ONLY scan if the URL’s path ends with a known “risky” extension:
-        #    .exe, .zip, .pdf, .tar, .gz, .rar, .7z, .msi, .apk, .dmg, .iso,
-        #    .doc, .docx, .xls, .xlsx, .ppt, .pptx, .bat
-        # ──────────────────────────────────────────────────────────────────────────
-        scan_exts = (
-            ".exe", ".zip", ".pdf", ".tar", ".gz", ".rar",
-            ".7z", ".msi", ".apk", ".dmg", ".iso", ".doc",
-            ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".bat"
-        )
-        if any(path.endswith(ext) for ext in scan_exts):
-            raw_data = flow.response.raw_content
-            logger.info(f"[VT] Scanning “downloadable” payload from {url}")
-            malicious_file = await is_file_malicious(raw_data)
-
-            if BLOCK_MALICIOUS and malicious_file:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
-                    {"Content-Type": "text/html"},
-                )
-                return
-
-            # Optional: after file check, also check domain
-            domain = urlparse(url).netloc.lower()
-            malicious_domain = await is_domain_malicious(domain)
-            if BLOCK_MALICIOUS and malicious_domain:
-                flow.response = http.Response.make(
-                    403,
-                    b"<h1>403 Forbidden</h1><p>Blocked by VT domain reputation</p>",
-                    {"Content-Type": "text/html"},
-                )
-            return
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # 3) Everything else—images, CSS, JS, HTML, fonts, etc.—is skipped:
-        # ──────────────────────────────────────────────────────────────────────────
-        return
-
-    async def websocket_message(self, flow: websocket.WebSocketFlow):
-        """
-        Called for every WebSocket message. We inspect binary frames and, if they exceed
-        a size threshold, send them to VT for scanning. If VT says “malicious,” we terminate.
-        """
-        # Only examine binary messages (from either client or server)
-        if flow.messages and flow.messages[-1].is_binary:
-            msg = flow.messages[-1]
-            data = msg.content  # raw bytes of this WS frame
-
-            # Heuristic: only scan if the binary frame is “large enough” to be a file (>10 KiB).
-            # (You can adjust WS_BINARY_MIN_SIZE or add more checks, e.g. file magic.)
-            if len(data) >= WS_BINARY_MIN_SIZE:
-                logger.info(f"[VT][WS] Scanning binary WS frame ({len(data)} bytes) for {flow.server_conn.address.host}")
-
-                try:
-                    malicious = await is_file_malicious(data)
-                except Exception as e:
-                    logger.warning(f"[VT][WS] file scan error: {e}")
-                    malicious = False
-
-                if BLOCK_MALICIOUS and malicious:
-                    logger.info(f"[VT][WS] Malicious WS payload detected—closing connection.")
-                    # Drop this WebSocket connection entirely
-                    flow.reply.kill()
-                    return
-
-        # Otherwise, let everything else pass through
-        return
+        # HTML pages: you could scan inline scripts or references, but skip for brevity
+        # Everything else passes through
 
 
 async def run_proxy():
@@ -386,7 +318,6 @@ async def run_proxy():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
     logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
     await m.run()
-
 
 if __name__ == "__main__":
     asyncio.run(run_proxy())
