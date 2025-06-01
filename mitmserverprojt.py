@@ -7,10 +7,8 @@ import time
 import requests
 import ipaddress
 import re
-import json
-import base64
-from urllib.parse import urlparse
 import hashlib
+from urllib.parse import urlparse
 
 from mitmproxy import http
 from mitmproxy.options import Options
@@ -50,19 +48,6 @@ FILE_CACHE_TTL = 3600     # 1 hour
 
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
-
-# ──────────────────────────────────────────────────────────────────────────────
-# EICAR test‐file constants
-# ──────────────────────────────────────────────────────────────────────────────
-
-# The exact 68-byte ASCII EICAR test string (no trailing newline):
-EICAR_ASCII = b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-# Precompute its SHA-256 hex:
-EICAR_SHA256 = hashlib.sha256(EICAR_ASCII).hexdigest()
-# A short substring of the ASCII form (for “quick” contain checks):
-EICAR_MAGIC_SUB = b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE!"
-# The Base64‐encoded form of that exact 68 bytes:
-EICAR_BASE64 = base64.b64encode(EICAR_ASCII)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
@@ -127,35 +112,20 @@ async def is_domain_malicious(domain: str) -> bool:
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    1) Aggressive EICAR check: look for raw ASCII or Base64‐encoded EICAR anywhere.
-    2) Normalize (strip whitespace) → compute SHA-256 → check in‐memory cache.
-    3) VT “report lookup” (GET /api/v3/files/{sha256}): if found, return result.
-    4) If sha256 == EICAR_SHA256, block immediately (cached).
-    5) Otherwise fall back to VT “upload & poll” exactly as before.
+    1) Normalize (strip whitespace) → compute SHA-256 → check in‐memory cache.
+    2) VT “report lookup” (GET /api/v3/files/{sha256}): if found, return result.
+    3) Otherwise fall back to VT “upload & poll” exactly as before.
     """
     raw = content_bytes
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 1) EICAR check:                                                            
-    #    a) Check for raw ASCII substring                                               
-    #    b) Check for Base64‐encoded form of the exact EICAR ASCII                
-    # ──────────────────────────────────────────────────────────────────────────
-
-    if EICAR_MAGIC_SUB in raw:
-        logger.warning("[EICAR] Found ASCII EICAR substring in payload → blocking immediately")
-        return True
-
-    if EICAR_BASE64 in raw:
-        logger.warning("[EICAR] Found Base64‐encoded EICAR payload → blocking immediately")
-        return True
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 2) Normalize and compute SHA-256                                   
-    # ──────────────────────────────────────────────────────────────────────────
-
     normalized = raw.strip()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2) Compute SHA-256 on normalized content
+    # ──────────────────────────────────────────────────────────────────────────
+
     sha256 = hashlib.sha256(normalized).hexdigest()
     now = time.time()
+
     if sha256 in _file_cache:
         age = now - _file_cache_timestamps.get(sha256, 0)
         if age < FILE_CACHE_TTL:
@@ -166,7 +136,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
         headers = {"x-apikey": api_key}
 
         # ──────────────────────────────────────────────────────────────────────
-        # 3) VT “report lookup” by hash (fast path)                              
+        # 3) VT “report lookup” by hash (fast path)
         # ──────────────────────────────────────────────────────────────────────
 
         report_url = f"https://www.virustotal.com/api/v3/files/{sha256}"
@@ -183,7 +153,6 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
                 _file_cache[sha256] = malicious
                 _file_cache_timestamps[sha256] = now
                 return malicious
-
             elif report_resp.status_code != 404:
                 # Something went wrong (403, 500, etc.) → fall back to upload
                 logger.warning(
@@ -194,17 +163,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             # Fall through to upload
 
         # ──────────────────────────────────────────────────────────────────────
-        # 4) If this is exactly the canonical EICAR SHA-256, block now           
-        # ──────────────────────────────────────────────────────────────────────
-
-        if sha256 == EICAR_SHA256:
-            logger.info(f"[EICAR] Exact EICAR SHA256 ({sha256[:10]}…) → blocking")
-            _file_cache[sha256] = True
-            _file_cache_timestamps[sha256] = now
-            return True
-
-        # ──────────────────────────────────────────────────────────────────────
-        # 5) Fallback: upload to VT and poll (your existing logic)                
+        # 4) Fallback: upload to VT and poll
         # ──────────────────────────────────────────────────────────────────────
 
         files = {"file": ("file", normalized)}
@@ -229,7 +188,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
             return False
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 6) Poll for file analysis result                                           
+    # 5) Poll for file analysis result (normal polling, no forced timeout)
     # ──────────────────────────────────────────────────────────────────────────
 
     vt_ana_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
@@ -275,6 +234,7 @@ class AllInOne:
         Called on every client→proxy→server request:
         1) Serve the mitmproxy CA if requested (so clients can fetch CA).
         2) Do VT domain reputation check, except for eicar.org.
+        3) Skip Service Worker requests outright.
         """
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
@@ -283,9 +243,14 @@ class AllInOne:
         domain = parsed.netloc.lower().split(":", 1)[0]
 
         # ──────────────────────────────────────────────────────────────────────
+        # SKIP: Service Worker (e.g., wp.serviceworker)
+        # ──────────────────────────────────────────────────────────────────────
+        if flow.request.path.endswith(".serviceworker") or "serviceworker" in flow.request.path.lower():
+            logger.info(f"[SKIP] Service Worker request: {flow.request.path}")
+            return
+
+        # ──────────────────────────────────────────────────────────────────────
         # EXCEPTION: If domain ends with “eicar.org”, skip everything here.
-        # That lets you browse https://www.eicar.org/download/eicar.com.txt
-        # without VT blocking the domain or scanning the response.
         # ──────────────────────────────────────────────────────────────────────
         if domain.endswith("eicar.org"):
             return
@@ -326,9 +291,7 @@ class AllInOne:
         Called on every server→proxy→client response:
         - Skip CA certificate responses
         - Skip “too‐small” responses (<50 bytes)
-        - Detect file downloads (by URL/path, Content-Disposition, or MIME‐type)
-        - If it looks like a download or a binary, call is_file_malicious(),
-          except if the domain is eicar.org.
+        - Detect file downloads (including .txt) and binaries, then scan them
         """
         if flow.response is None:
             return
@@ -340,7 +303,7 @@ class AllInOne:
         domain = parsed.netloc.lower().split(":", 1)[0]
 
         # ──────────────────────────────────────────────────────────────────────
-        # EXCEPTION: If domain ends with “eicar.org”, skip any file‐scanning here.
+        # SKIP: If domain ends with “eicar.org”, skip any file‐scanning here.
         # ──────────────────────────────────────────────────────────────────────
         if domain.endswith("eicar.org"):
             return
@@ -353,15 +316,19 @@ class AllInOne:
         if len(flow.response.raw_content) < 50:
             return
 
+        # Skip Service Worker responses
+        if flow.request.path.endswith(".serviceworker") or "serviceworker" in flow.request.path.lower():
+            return
+
         path = parsed.path.lower()
         query = parsed.query.lower()
         content_disp = flow.response.headers.get("Content-Disposition", "").lower()
 
-        # 1) File‐download patterns:
+        # 1) File‐download patterns (including .txt)
         is_download = any([
             "attachment" in content_disp,
             "download" in query,
-            re.search(r'\.(exe|dll|zip|rar|pdf|docx?|xlsx?|pptx?|jar)$', path),
+            re.search(r'\.(exe|dll|zip|rar|pdf|docx?|xlsx?|pptx?|jar|txt)$', path),
             "mms-type" in query
         ])
 
@@ -374,18 +341,18 @@ class AllInOne:
 
         # 3) If it’s a suspected download or binary, scan it
         if is_download or is_binary:
-            logger.info(f"Scanning file: {url} | Content-Type: {ctype}")
+            logger.info(f"[SCAN] Scanning file: {url} | Content-Type: {ctype}")
             try:
                 malicious = await is_file_malicious(flow.response.raw_content)
                 if malicious:
-                    logger.warning(f"Blocking malicious file: {url}")
+                    logger.warning(f"[BLOCK] Malicious file: {url}")
                     flow.response = http.Response.make(
                         403,
                         b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
                         {"Content-Type": "text/html"}
                     )
             except Exception as e:
-                logger.error(f"File scan failed: {e}")
+                logger.error(f"[ERROR] File scan failed: {e}")
 
 
 async def run_proxy():
