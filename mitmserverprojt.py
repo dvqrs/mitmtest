@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import logging
 import asyncio
 import itertools
@@ -6,7 +7,6 @@ import signal
 import time
 import requests
 import ipaddress
-import re  # Added regex import
 from urllib.parse import urlparse
 
 from mitmproxy import http
@@ -18,8 +18,6 @@ from mitmproxy.tools.dump import DumpMaster
 # ──────────────────────────────────────────────────────────────────────────────
 
 MITM_PORT = 8443
-
-# Path to mitmproxy's CA cert
 CA_PATH = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
 
 # VirusTotal API keys (rotate through them)
@@ -38,16 +36,26 @@ domain_check_semaphore = asyncio.Semaphore(len(VT_API_KEYS))
 
 # Cache for domain reputations
 _domain_cache = {}
-CACHE_TTL = 3600  # 1 hour
+_CACHE_TTL = 3600  # 1 hour
 _cache_timestamps = {}
 
 # Cache for file‐scan results (by SHA256)
 _file_cache = {}
+_FILE_CACHE_TTL = 3600  # 1 hour
 _file_cache_timestamps = {}
-FILE_CACHE_TTL = 3600  # 1 hour
 
 # Whether to block malicious domains/files
 BLOCK_MALICIOUS = True
+
+# Size thresholds for download scanning (in bytes)
+MIN_SCAN_SIZE = 10 * 1024           # 10 KB
+MAX_SCAN_SIZE = 100 * 1024 * 1024   # 100 MB
+
+# Skip truly “inline” static asset extensions
+SKIP_EXTS = (
+    ".ico", ".svg", ".woff", ".woff2", ".ttf",
+    ".png", ".jpg", ".jpeg", ".gif", ".css", ".js"
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mitmproxy")
@@ -60,8 +68,8 @@ def get_vt_api_key() -> str:
 
 def is_private_or_localhost(hostname: str) -> bool:
     """
-    Return True if `hostname` is 'localhost' or a private‐network IP.
-    Used to skip VT lookups on those.
+    Return True if `hostname` is 'localhost' or a private IP.
+    Skip VT lookups on those domains.
     """
     hn = hostname.lower().split(":", 1)[0]
     if hn == "localhost":
@@ -75,8 +83,8 @@ def is_private_or_localhost(hostname: str) -> bool:
 
 async def is_domain_malicious(domain: str) -> bool:
     """
-    Asynchronously query VT domain endpoint; return True if malicious.
-    Skip VT if domain is private or localhost.
+    Query VT’s domain‐reputation API asynchronously; return True if malicious.
+    Skip if domain is private or localhost. Cache results for up to _CACHE_TTL.
     """
     if is_private_or_localhost(domain):
         return False
@@ -85,7 +93,7 @@ async def is_domain_malicious(domain: str) -> bool:
     now = time.time()
     if domain_to_check in _domain_cache:
         age = now - _cache_timestamps.get(domain_to_check, 0)
-        if age < CACHE_TTL:
+        if age < _CACHE_TTL:
             return _domain_cache[domain_to_check]
 
     async with domain_check_semaphore:
@@ -112,8 +120,8 @@ async def is_domain_malicious(domain: str) -> bool:
 
 async def is_file_malicious(content_bytes: bytes) -> bool:
     """
-    Submit binary to VT's file‐scan endpoint, poll until analysis,
-    return True if VT flags it malicious. Uses SHA256 cache.
+    Submit file‐bytes to VT’s file‐scan API, poll until analysis completes,
+    return True if VT flags it malicious. Uses SHA256 cache for _FILE_CACHE_TTL.
     """
     import hashlib
 
@@ -121,7 +129,7 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
     now = time.time()
     if sha256 in _file_cache:
         age = now - _file_cache_timestamps.get(sha256, 0)
-        if age < FILE_CACHE_TTL:
+        if age < _FILE_CACHE_TTL:
             return _file_cache[sha256]
 
     async with file_scan_semaphore:
@@ -157,7 +165,8 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
 
             headers = {"x-apikey": api_key}
             r = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: requests.get(vt_url, headers=headers, timeout=10)
+                None,
+                lambda: requests.get(vt_url, headers=headers, timeout=10)
             )
             r.raise_for_status()
             j = r.json()
@@ -186,14 +195,14 @@ async def is_file_malicious(content_bytes: bytes) -> bool:
 class AllInOne:
     async def request(self, flow: http.HTTPFlow):
         """
-        Called on every client → proxy → server request.
-        1) Serve the Mitmproxy CA if requested.
-        2) Domain reputation check.
+        Called on every client→proxy→server request.
+        1) Serve the mitmproxy CA if requested.
+        2) Domain reputation check for all other requests.
         """
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
 
-        # 1) Serve the Mitmproxy CA if requested
+        # 1) Serve the Mitmproxy CA if the client fetches it
         if flow.request.path == "/mitmproxy-ca-cert.pem":
             if not os.path.isfile(CA_PATH):
                 flow.response = http.Response.make(
@@ -212,7 +221,7 @@ class AllInOne:
             )
             return
 
-        # 2) Domain reputation check (async)
+        # 2) Domain reputation check for everything else
         parsed = urlparse(url)
         domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
@@ -224,14 +233,15 @@ class AllInOne:
             )
             return
 
-
     async def response(self, flow: http.HTTPFlow):
         """
-        Called on every server → proxy → client response.
-        Enhanced with:
-          - Small response skipping
-          - File download pattern detection
-          - Extended binary detection
+        Called on every server→proxy→client response.
+
+        1) Skip truly inline/static assets (CSS, JS, fonts, images under SKIP_EXTS).  
+        2) Otherwise, fetch raw bytes, measure size.  
+        3) If size < MIN_SCAN_SIZE or > MAX_SCAN_SIZE, skip.  
+        4) If size in [MIN, MAX], this is a “download candidate” → VT scan.  
+        5) If VT flags malicious, return a 403; otherwise let it pass.
         """
         if flow.response is None:
             return
@@ -239,45 +249,46 @@ class AllInOne:
         url = flow.request.pretty_url
         logger.info(f"[RESPONSE] {url}")
 
-        # Skip small responses (<50 bytes)
-        if len(flow.response.raw_content) < 50:
+        path = urlparse(url).path.lower()
+
+        # ── 1) Skip purely static/inline assets ─────────────────────────────────
+        #    CSS, JS, icons, fonts, small images—never scan those.
+        if path.endswith(SKIP_EXTS):
+            if path.endswith((".css", ".js")):
+                logger.info(f"[INLINE] Allowing static asset: {path}")
             return
 
-        parsed = urlparse(url)
-        path = parsed.path.lower()
-        query = parsed.query.lower()
-        content_disp = flow.response.headers.get("Content-Disposition", "").lower()
+        # ── 2) Fetch raw content and measure size ──────────────────────────────
+        raw_data = flow.response.raw_content
+        size_bytes = len(raw_data)
+        logger.info(f"[DOWNLOAD] Detected download candidate: size={size_bytes} bytes")
 
-        # 1. File download patterns
-        is_download = any([
-            "attachment" in content_disp,
-            "download" in query,
-            re.search(r'\.(exe|dll|zip|rar|pdf|docx?|xlsx?|pptx?|jar)$', path),
-            "mms-type" in query
-        ])
+        # ── 3) Size thresholds: skip if too small or too large ─────────────────
+        if size_bytes < MIN_SCAN_SIZE:
+            logger.info(f"[SKIP] Under {MIN_SCAN_SIZE // 1024} KB → not scanning")
+            return
+        if size_bytes > MAX_SCAN_SIZE:
+            logger.info(f"[SKIP] Over {MAX_SCAN_SIZE // (1024 * 1024)} MB → not scanning")
+            return
 
-        # 2. Extended binary detection
+        # ── 4) VT‐scan everything in [MIN, MAX] bytes ──────────────────────────
         ctype = flow.response.headers.get("Content-Type", "").lower()
-        is_binary = any(term in ctype for term in [
-            "octet-stream", "pdf", "zip", "x-msdownload", 
-            "vnd.microsoft.portable-executable", "video", "image"
-        ])
+        try:
+            logger.info(f"[VT] Scanning download from {url} (size={size_bytes}, Content-Type={ctype})")
+            malicious_file = await is_file_malicious(raw_data)
+        except Exception as e:
+            logger.warning(f"[RESPONSE] file scanning error: {e}")
+            malicious_file = False
 
-        # 3. Process suspicious responses
-        if is_download or is_binary:
-            logger.info(f"Scanning file: {url} | Type: {ctype}")
-            try:
-                malicious = await is_file_malicious(flow.response.raw_content)
-                if malicious:
-                    logger.warning(f"Blocking malicious file: {url}")
-                    flow.response = http.Response.make(
-                        403,
-                        b"<h1>403 Forbidden</h1><p>Blocked malicious file download</p>",
-                        {"Content-Type": "text/html"},
-                    )
-            except Exception as e:
-                logger.error(f"File scan failed: {str(e)}")
+        if BLOCK_MALICIOUS and malicious_file:
+            flow.response = http.Response.make(
+                403,
+                b"<h1>403 Forbidden</h1><p>Blocked malicious download</p>",
+                {"Content-Type": "text/html"},
+            )
+            return
 
+        # If not malicious, allow unchanged.
 
 async def run_proxy():
     loop = asyncio.get_running_loop()
@@ -288,7 +299,6 @@ async def run_proxy():
         loop.add_signal_handler(sig, lambda: asyncio.create_task(m.shutdown()))
     logger.info(f"[*] mitmproxy running on port {MITM_PORT}…")
     await m.run()
-
 
 if __name__ == "__main__":
     asyncio.run(run_proxy())
