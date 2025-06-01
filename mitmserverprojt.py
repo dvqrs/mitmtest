@@ -274,10 +274,21 @@ class AllInOne:
         """
         Called on every client→proxy→server request:
         1) Serve the mitmproxy CA if requested (so clients can fetch CA).
-        2) Do VT domain reputation check.
+        2) Do VT domain reputation check, except for eicar.org.
         """
         url = flow.request.pretty_url
         logger.info(f"[REQUEST] {url}")
+
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().split(":", 1)[0]
+
+        # ──────────────────────────────────────────────────────────────────────
+        # EXCEPTION: If domain ends with “eicar.org”, skip everything here.
+        # That lets you browse https://www.eicar.org/download/eicar.com.txt
+        # without VT blocking the domain or scanning the response.
+        # ──────────────────────────────────────────────────────────────────────
+        if domain.endswith("eicar.org"):
+            return
 
         # 1) Serve the Mitmproxy CA if client requests “/mitmproxy-ca-cert.pem”
         if flow.request.path == "/mitmproxy-ca-cert.pem":
@@ -301,8 +312,6 @@ class AllInOne:
             return
 
         # 2) Domain reputation check (async)
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower()
         malicious_domain = await is_domain_malicious(domain)
         if BLOCK_MALICIOUS and malicious_domain:
             flow.response = http.Response.make(
@@ -318,13 +327,23 @@ class AllInOne:
         - Skip CA certificate responses
         - Skip “too‐small” responses (<50 bytes)
         - Detect file downloads (by URL/path, Content-Disposition, or MIME‐type)
-        - If it looks like a download or a binary, call is_file_malicious()
+        - If it looks like a download or a binary, call is_file_malicious(),
+          except if the domain is eicar.org.
         """
         if flow.response is None:
             return
 
         url = flow.request.pretty_url
         logger.info(f"[RESPONSE] {url}")
+
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().split(":", 1)[0]
+
+        # ──────────────────────────────────────────────────────────────────────
+        # EXCEPTION: If domain ends with “eicar.org”, skip any file‐scanning here.
+        # ──────────────────────────────────────────────────────────────────────
+        if domain.endswith("eicar.org"):
+            return
 
         # Skip CA certificate itself
         if flow.request.path == "/mitmproxy-ca-cert.pem":
@@ -334,7 +353,6 @@ class AllInOne:
         if len(flow.response.raw_content) < 50:
             return
 
-        parsed = urlparse(url)
         path = parsed.path.lower()
         query = parsed.query.lower()
         content_disp = flow.response.headers.get("Content-Disposition", "").lower()
@@ -371,7 +389,7 @@ class AllInOne:
 
 
 async def run_proxy():
-    loop = asyncio.get_running_loop()
+    loop = asyncio.get_event_loop()
     opts = Options(listen_host="0.0.0.0", listen_port=MITM_PORT, ssl_insecure=True)
     m = DumpMaster(opts)
     m.addons.add(AllInOne())
